@@ -141,7 +141,8 @@ def cached_anomaly(ticker: str) -> dict:
     tech = cached_technicals(ticker)
     sent = cached_sentiment(ticker)
     return compute_anomaly(ticker, tech, sent, check_earnings=True,
-                           check_sector=True, check_fundamentals=True)
+                           check_sector=True, check_fundamentals=True,
+                           check_factor_model=True)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -152,6 +153,12 @@ def cached_yahoo_fast(ticker: str) -> dict:
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_fundamentals(ticker: str) -> dict:
     return get_fundamentals(ticker)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_factor_model(ticker: str) -> dict:
+    from data.factor_model import compute_factor_model
+    return compute_factor_model(ticker)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -294,11 +301,24 @@ def cached_market_scan() -> list:
             row["fundamental_score"]  = 0
             row["fundamental_signal"] = "Neutral"
 
+    # Stage 11: augment top 10 with factor model composite score
+    for row in results[:10]:
+        try:
+            fm = cached_factor_model(row["ticker"])
+            row["composite_factor_score"] = fm.get("composite_score", 50.0)
+            row["factor_signal"]          = fm.get("composite_signal", "Neutral")
+            row["pead_candidate"]         = fm.get("pead_candidate", False)
+        except Exception:
+            row["composite_factor_score"] = 50.0
+            row["factor_signal"]          = "Neutral"
+            row["pead_candidate"]         = False
+
     def _composite(r):
-        anomaly_norm = min((r.get("score") or 0) / 6.0, 1.0) * 40
-        fund_norm    = ((r.get("fundamental_score") or 0) + 100) / 200 * 35
-        qual_norm    = (r.get("quality_score") or 0) / 100 * 25
-        return anomaly_norm + fund_norm + qual_norm
+        anomaly_norm = min((r.get("score") or 0) / 6.0, 1.0) * 30
+        fund_norm    = ((r.get("fundamental_score") or 0) + 100) / 200 * 25
+        qual_norm    = (r.get("quality_score") or 0) / 100 * 20
+        factor_norm  = (r.get("composite_factor_score") or 50.0) / 100 * 25
+        return anomaly_norm + fund_norm + qual_norm + factor_norm
 
     results.sort(key=_composite, reverse=True)
     return results
@@ -707,6 +727,82 @@ def _build_gauge(score, label: str) -> go.Figure:
     return fig
 
 
+def _build_factor_radar(factor_model_dict: dict) -> go.Figure:
+    """
+    Plotly polar radar chart showing all 6 factor percentile scores (0-100).
+    50 = market average. Green fill for strong factors, neutral otherwise.
+    """
+    factors = factor_model_dict.get("factors", {})
+    labels  = []
+    values  = []
+    factor_order = [
+        ("momentum",          "Momentum"),
+        ("earnings_momentum", "Earnings"),
+        ("value",             "Value"),
+        ("quality",           "Quality"),
+        ("short_interest",    "Short Int."),
+        ("institutional",     "Inst. Flow"),
+    ]
+    for key, display in factor_order:
+        f = factors.get(key, {})
+        pct = f.get("percentile", 50.0) if f.get("available") else 50.0
+        labels.append(display)
+        values.append(round(pct, 1))
+
+    # Close the polygon
+    labels_closed = labels + [labels[0]]
+    values_closed = values + [values[0]]
+
+    composite = factor_model_dict.get("composite_score", 50.0)
+    fill_color = "rgba(0,255,136,0.15)" if composite >= 65 else (
+                 "rgba(255,68,68,0.15)"  if composite <= 35 else
+                 "rgba(136,136,136,0.1)"
+    )
+    line_color = GREEN if composite >= 65 else (RED if composite <= 35 else NEUTRAL)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(
+        r=values_closed,
+        theta=labels_closed,
+        fill="toself",
+        fillcolor=fill_color,
+        line=dict(color=line_color, width=2),
+        name="Factor Score",
+        hovertemplate="%{theta}: %{r:.0f}th pct<extra></extra>",
+    ))
+    # 50th percentile reference ring
+    fig.add_trace(go.Scatterpolar(
+        r=[50] * (len(labels) + 1),
+        theta=labels_closed,
+        mode="lines",
+        line=dict(color="#333333", width=1, dash="dot"),
+        name="Avg (50th)",
+        hoverinfo="skip",
+    ))
+    fig.update_layout(
+        polar=dict(
+            bgcolor=BG2,
+            radialaxis=dict(
+                range=[0, 100],
+                tickvals=[25, 50, 75],
+                ticktext=["25", "50", "75"],
+                tickfont=dict(size=8, color=NEUTRAL),
+                gridcolor="#2a2d35",
+            ),
+            angularaxis=dict(
+                tickfont=dict(size=10, color="#fafafa"),
+                gridcolor="#2a2d35",
+            ),
+        ),
+        paper_bgcolor=BG,
+        font=dict(color="#fafafa"),
+        showlegend=False,
+        height=280,
+        margin=dict(l=40, r=40, t=30, b=20),
+    )
+    return fig
+
+
 def _build_sector_heatmap(sectors: list) -> go.Figure:
     """
     Horizontal bar chart showing today's % change for all 11 sector ETFs.
@@ -1055,6 +1151,81 @@ def _render_market_tab(selected: str):
             text=f"Signal Quality: {q_score}/100",
         )
 
+    # ── FACTOR MODEL (Stage 11) ───────────────────────────────────────────────
+    fm_data = an_data.get("factor_model")
+    if fm_data and not fm_data.get("error"):
+        composite_fs  = an_data.get("composite_factor_score")
+        fm_signal     = fm_data.get("composite_signal", "Neutral")
+        fm_completeness = fm_data.get("data_completeness", 0.0)
+
+        fm_color = GREEN if fm_signal == "Long" else (RED if fm_signal == "Short" else NEUTRAL)
+        sign_c   = "+" if (composite_fs or 50) >= 50 else ""
+        st.markdown(
+            f'<div style="background:{BG2};border:1px solid {fm_color};border-radius:6px;'
+            f'padding:7px 14px;margin:6px 0;display:flex;justify-content:space-between;align-items:center">'
+            f'<span style="font-size:1.0rem;font-weight:bold;color:{fm_color}">'
+            f'Factor Model: {composite_fs:.0f}/100 · {fm_signal.upper()}'
+            f'</span>'
+            f'<span style="color:{NEUTRAL};font-size:0.78rem">'
+            f'Data completeness: {fm_completeness*100:.0f}%</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        # PEAD banner
+        if an_data.get("pead_candidate"):
+            st.info("POST-EARNINGS DRIFT (PEAD) — Active drift opportunity detected. "
+                    "Positive earnings surprise within the drift window.")
+
+        # Radar chart + factor table side by side
+        fm_left, fm_right = st.columns([2, 3])
+        with fm_left:
+            st.plotly_chart(_build_factor_radar(fm_data), width="stretch",
+                            config={"displayModeBar": False})
+
+        with fm_right:
+            st.caption("Factor Breakdown")
+            factors       = fm_data.get("factors", {})
+            weights_used  = fm_data.get("weights_used", {})
+            factor_labels = [
+                ("momentum",          "Price Momentum"),
+                ("earnings_momentum", "Earnings Momentum"),
+                ("value",             "Value"),
+                ("quality",           "Quality"),
+                ("short_interest",    "Short Interest"),
+                ("institutional",     "Institutional Flow"),
+            ]
+            tbl_rows = []
+            for fkey, fname in factor_labels:
+                f       = factors.get(fkey, {})
+                pct     = f.get("percentile", 50.0) if f.get("available") else None
+                wt      = weights_used.get(fkey, 0.0)
+                notes   = f.get("notes", "—")
+                avail   = f.get("available", False)
+                if pct is not None:
+                    bar_filled = int(round(pct / 5))   # 0-20 blocks
+                    bar_empty  = 20 - bar_filled
+                    bar_str    = "▓" * bar_filled + "░" * bar_empty
+                    pct_color  = GREEN if pct >= 65 else (RED if pct <= 35 else NEUTRAL)
+                    pct_str    = f"{pct:.0f}th"
+                else:
+                    bar_str   = "░" * 20
+                    pct_color = NEUTRAL
+                    pct_str   = "N/A"
+                tbl_rows.append((fname, pct_str, pct_color, f"{wt*100:.0f}%", bar_str, notes))
+
+            for fname, pct_str, pct_color, wt_str, bar_str, notes in tbl_rows:
+                st.markdown(
+                    f'<div style="font-family:monospace;font-size:0.76rem;'
+                    f'border-bottom:1px solid #1e2128;padding:3px 0">'
+                    f'<span style="color:#fafafa;width:150px;display:inline-block">{fname}</span>'
+                    f'<span style="color:{pct_color};width:52px;display:inline-block">{pct_str}</span>'
+                    f'<span style="color:{NEUTRAL};width:32px;display:inline-block">{wt_str}</span>'
+                    f'<span style="color:#555;font-size:0.65rem;margin-left:8px">{bar_str}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
     # Tabbed charts
     tab_intra, tab_daily, tab_weekly = st.tabs(
         ["Intraday (1-Min)", "Daily (3 Month + Indicators)", "Weekly (1 Year)"]
@@ -1295,7 +1466,7 @@ def _render_screener_tab():
         # Column header strip (HTML — no buttons)
         st.markdown(
             '<div style="display:grid;'
-            'grid-template-columns:85px 75px 70px 55px 55px 1fr 88px;'
+            'grid-template-columns:85px 75px 70px 55px 55px 60px 1fr 88px;'
             'gap:4px;padding:5px 0 3px 0;'
             'font-size:0.7rem;color:#555;font-weight:bold;'
             'border-bottom:1px solid #2a2d35;font-family:monospace">'
@@ -1304,6 +1475,7 @@ def _render_screener_tab():
             '<span>CHG%</span>'
             '<span>SCORE</span>'
             '<span>DIR</span>'
+            '<span>FACTOR</span>'
             '<span>SIGNALS / REASON</span>'
             '<span></span>'
             '</div>',
@@ -1318,6 +1490,9 @@ def _render_screener_tab():
             chg       = row.get("change_pct")
             direction = row.get("direction", "")
             in_wl     = ticker in watchlist
+            fm_score  = row.get("composite_factor_score")
+            fm_sig    = row.get("factor_signal", "")
+            pead      = row.get("pead_candidate", False)
 
             dir_color = GREEN if direction == "Long" else (RED if direction == "Short" else NEUTRAL)
             accent    = dir_color
@@ -1325,15 +1500,20 @@ def _render_screener_tab():
             chg_c     = GREEN if (chg or 0) >= 0 else RED
             price_str = f"${price:.2f}" if price else "N/A"
             chg_str   = f"{chg:+.2f}%" if chg is not None else "N/A"
+            fm_color  = (GREEN if fm_sig == "Long" else (RED if fm_sig == "Short" else NEUTRAL))
+            fm_str    = f"{fm_score:.0f}" if fm_score is not None else "—"
+
+            ticker_display = ticker + (" 🔥" if row.get("is_watch") else "")
+            if pead:
+                ticker_display += " 📈"
 
             # One st.columns() strip per row — required for st.button in last column
-            c1, c2, c3, c4, c4b, c5, c6 = st.columns([1.1, 1, 0.9, 0.7, 0.7, 4.2, 1.1])
+            c1, c2, c3, c4, c4b, c4c, c5, c6 = st.columns([1.1, 1, 0.9, 0.7, 0.7, 0.75, 4.2, 1.1])
 
             with c1:
-                fire = " 🔥" if row.get("is_watch") else ""
                 st.markdown(
                     f'<span style="font-weight:bold;color:{accent};'
-                    f'font-family:monospace;font-size:0.9rem">{ticker}{fire}</span>',
+                    f'font-family:monospace;font-size:0.9rem">{ticker_display}</span>',
                     unsafe_allow_html=True,
                 )
             with c2:
@@ -1358,6 +1538,11 @@ def _render_screener_tab():
                     f'font-size:0.82rem">{direction}</span>',
                     unsafe_allow_html=True,
                 )
+            with c4c:
+                st.markdown(
+                    f'<span style="color:{fm_color};font-size:0.82rem">{fm_str}</span>',
+                    unsafe_allow_html=True,
+                )
             with c5:
                 st.markdown(
                     f'<span style="color:{NEUTRAL};font-size:0.76rem">'
@@ -1375,6 +1560,26 @@ def _render_screener_tab():
                         add_ticker(ticker)
                         st.session_state.selected_ticker = ticker
                         st.rerun()
+
+        # PEAD section — show any PEAD candidates from the scan
+        pead_rows = [r for r in scan_results if r.get("pead_candidate")]
+        if pead_rows:
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown(
+                f'<span style="color:{GREEN};font-size:0.75rem;font-weight:bold">'
+                f'📈 PEAD CANDIDATES — Post-Earnings Drift Active</span>',
+                unsafe_allow_html=True,
+            )
+            for pr in pead_rows:
+                st.markdown(
+                    f'<div style="background:#00ff8812;border:1px solid {GREEN};'
+                    f'border-radius:4px;padding:5px 12px;margin:2px 0;font-size:0.78rem">'
+                    f'<b style="color:{GREEN}">{pr["ticker"]}</b>'
+                    f'&nbsp;— Factor: {pr.get("composite_factor_score", "—"):.0f}/100'
+                    f'&nbsp;|&nbsp;{pr.get("reason", "")}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
 
 
 # ── Portfolio Tab ─────────────────────────────────────────────────────────────

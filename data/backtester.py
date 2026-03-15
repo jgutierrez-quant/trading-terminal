@@ -262,6 +262,8 @@ def run_backtest(
     quality_threshold: int = 50,
     watch_threshold: int = WATCH_THRESHOLD,
     check_earnings: bool = True,
+    check_fundamentals: bool = False,
+    factor_threshold: int = 0,
 ) -> dict:
     """
     Sequential backtest with no look-ahead bias.
@@ -273,6 +275,10 @@ def run_backtest(
         - Earnings avoidance: skip entry within 5 days of earnings
         - watch_threshold parameter for threshold-3 vs threshold-4 comparisons
         - New metrics: avg_hold_days, exit_breakdown
+
+    Stage 11 additions:
+        - factor_threshold: when > 0, skip trades where composite_factor_score < threshold
+          ⚠️ Uses current factor model snapshot — introduces look-ahead bias for historical periods
 
     Exit priority per bar:
         1. Stop hit (ATR x 2.0)
@@ -289,6 +295,30 @@ def run_backtest(
     # Earnings dates — fetched once, checked at each potential entry
     earnings_dates = _fetch_earnings_dates(ticker) if check_earnings else set()
 
+    # Fundamentals — fetched once as a static snapshot
+    # ⚠️ Uses current fundamentals — introduces look-ahead bias for historical periods
+    fundamental_score = 0
+    fund_dict_cached  = None
+    if check_fundamentals:
+        try:
+            from data.fundamentals import get_fundamentals, score_fundamentals
+            fund_dict_cached  = get_fundamentals(ticker)
+            fund_scored       = score_fundamentals(fund_dict_cached)
+            fundamental_score = fund_scored.get("fundamental_score", 0)
+        except Exception as exc:
+            logger.debug("Backtest fundamentals fetch failed for %s: %s", ticker, exc)
+
+    # Factor model — fetched once as a static snapshot
+    # ⚠️ Uses current factor model — introduces look-ahead bias for historical periods
+    composite_factor_score = None
+    if factor_threshold > 0:
+        try:
+            from data.factor_model import compute_factor_model
+            fm = compute_factor_model(ticker, fund_dict=fund_dict_cached)
+            composite_factor_score = fm.get("composite_score", 50.0)
+        except Exception as exc:
+            logger.debug("Backtest factor model fetch failed for %s: %s", ticker, exc)
+
     capital       = float(initial_capital)
     trades        = []
     equity_events = {}
@@ -301,9 +331,21 @@ def run_backtest(
             continue
 
         # Quality filter
-        if int(df['quality_score'].iloc[i]) < quality_threshold:
+        quality_score_bar = int(df['quality_score'].iloc[i])
+        if check_fundamentals:
+            composite = 0.7 * quality_score_bar + 0.3 * max(fundamental_score, 0)
+            if composite < quality_threshold:
+                i += 1
+                continue
+        elif quality_score_bar < quality_threshold:
             i += 1
             continue
+
+        # Factor model filter
+        if factor_threshold > 0 and composite_factor_score is not None:
+            if composite_factor_score < factor_threshold:
+                i += 1
+                continue
 
         entry_idx   = i + 1
         entry_price = float(df['Open'].iloc[entry_idx])
@@ -393,18 +435,20 @@ def run_backtest(
         equity_events[exit_date] = capital
 
         trades.append({
-            'entry_date':    entry_date,
-            'exit_date':     exit_date,
-            'entry_price':   round(entry_price, 4),
-            'exit_price':    round(exit_price,  4),
-            'shares':        shares,
-            'side':          side,
-            'pnl':           round(pnl, 2),
-            'pnl_pct':       round(pnl_pct, 2),
-            'outcome':       outcome,
-            'signals':       str(df['signal_list'].iloc[i]),
-            'signal_count':  int(df['signal_count'].iloc[i]),
-            'quality_score': int(df['quality_score'].iloc[i]),
+            'entry_date':       entry_date,
+            'exit_date':        exit_date,
+            'entry_price':      round(entry_price, 4),
+            'exit_price':       round(exit_price,  4),
+            'shares':           shares,
+            'side':             side,
+            'pnl':              round(pnl, 2),
+            'pnl_pct':          round(pnl_pct, 2),
+            'outcome':          outcome,
+            'signals':          str(df['signal_list'].iloc[i]),
+            'signal_count':     int(df['signal_count'].iloc[i]),
+            'quality_score':         int(df['quality_score'].iloc[i]),
+            'fundamental_score':     fundamental_score,
+            'composite_factor_score': composite_factor_score,
         })
 
         i = exit_bar + 1
