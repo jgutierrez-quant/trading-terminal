@@ -41,6 +41,7 @@ from utils.risk_manager             import (calculate_position_size, calculate_s
                                             get_market_hours)
 from utils.trade_logger             import log_signal, log_trade, get_performance_summary
 from dashboard.backtest_tab         import render_backtest_tab
+from data.fundamentals              import get_fundamentals, score_fundamentals, get_short_squeeze_score
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -136,15 +137,21 @@ def cached_technicals(ticker: str) -> dict:
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_anomaly(ticker: str) -> dict:
     """Calls cached_technicals + cached_sentiment — avoids duplicate API calls.
-    Enables earnings proximity and sector momentum checks for the dashboard view."""
+    Enables earnings proximity, sector momentum, and fundamentals checks for the dashboard view."""
     tech = cached_technicals(ticker)
     sent = cached_sentiment(ticker)
-    return compute_anomaly(ticker, tech, sent, check_earnings=True, check_sector=True)
+    return compute_anomaly(ticker, tech, sent, check_earnings=True,
+                           check_sector=True, check_fundamentals=True)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_yahoo_fast(ticker: str) -> dict:
     return _yahoo_fast(ticker)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_fundamentals(ticker: str) -> dict:
+    return get_fundamentals(ticker)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -266,7 +273,7 @@ def cached_market_scan() -> list:
             anomaly = compute_anomaly(ticker, tech, mock_sent)
             if not anomaly.get("is_watch"):
                 continue
-            if anomaly.get("quality_score", 0) < 60:
+            if anomaly.get("quality_score", 0) < 50:
                 continue
             pi = price_map.get(ticker, {})
             row = dict(anomaly)
@@ -276,8 +283,24 @@ def cached_market_scan() -> list:
         except Exception:
             continue
 
-    # Stage 9: sort by quality_score (was raw score)
-    results.sort(key=lambda r: r.get("quality_score", 0), reverse=True)
+    # Stage 10: augment top 15 with fundamentals, then apply composite ranking
+    for row in results[:15]:
+        try:
+            fund  = cached_fundamentals(row["ticker"])
+            scored = score_fundamentals(fund)
+            row["fundamental_score"]  = scored["fundamental_score"]
+            row["fundamental_signal"] = scored["fundamental_signal"]
+        except Exception:
+            row["fundamental_score"]  = 0
+            row["fundamental_signal"] = "Neutral"
+
+    def _composite(r):
+        anomaly_norm = min((r.get("score") or 0) / 6.0, 1.0) * 40
+        fund_norm    = ((r.get("fundamental_score") or 0) + 100) / 200 * 35
+        qual_norm    = (r.get("quality_score") or 0) / 100 * 25
+        return anomaly_norm + fund_norm + qual_norm
+
+    results.sort(key=_composite, reverse=True)
     return results
 
 
@@ -814,19 +837,94 @@ def _render_market_tab(selected: str):
             unsafe_allow_html=True,
         )
 
-    # ── FUNDAMENTALS ROW ──────────────────────────────────────────────────────
-    f_cols = st.columns(6)
-    fund_rows = [
-        ("Market Cap",   _fmt_cap(fund.get("market_cap"))),
-        ("P/E (Trail.)", _fmt_float(fund.get("pe_ratio"),   2, "x")),
-        ("P/E (Fwd)",    _fmt_float(fund.get("forward_pe"), 2, "x")),
-        ("52w High",     _fmt_price(fund.get("52w_high"))),
-        ("52w Low",      _fmt_price(fund.get("52w_low"))),
-        ("Beta",         _fmt_float(fund.get("beta"), 2)),
+    # ── FUNDAMENTALS PANEL ────────────────────────────────────────────────────
+    fund2        = cached_fundamentals(selected)
+    fund_scored2 = score_fundamentals(fund2)
+    fund_score   = fund_scored2["fundamental_score"]
+    fund_signal  = fund_scored2["fundamental_signal"]
+    fund_reasons = fund_scored2["fundamental_reasons"]
+    squeeze_info = get_short_squeeze_score(fund2)
+
+    # Row 1 — Valuation
+    st.caption("Valuation")
+    r1_cols = st.columns(6)
+    r1_data = [
+        ("Market Cap",   _fmt_cap(fund2.get("market_cap"))),
+        ("P/E (Trail.)", _fmt_float(fund2.get("pe_ratio"),    2, "x")),
+        ("P/E (Fwd)",    _fmt_float(fund2.get("forward_pe"),  2, "x")),
+        ("PEG",          _fmt_float(fund2.get("peg_ratio"),   2)),
+        ("P/B",          _fmt_float(fund2.get("pb_ratio"),    2, "x")),
+        ("EV/EBITDA",    _fmt_float(fund2.get("ev_ebitda"),   1, "x")),
     ]
-    for i, (lbl, val) in enumerate(fund_rows):
-        with f_cols[i]:
+    for i, (lbl, val) in enumerate(r1_data):
+        with r1_cols[i]:
             st.metric(label=lbl, value=val)
+
+    # Row 2 — Growth & Health
+    st.caption("Growth & Financial Health")
+    r2_cols = st.columns(6)
+    rev_g  = fund2.get("revenue_growth")
+    earn_g = fund2.get("earnings_growth")
+    pm     = fund2.get("profit_margins")
+    r2_data = [
+        ("Revenue Growth",  ("N/A" if rev_g  is None else f"{rev_g*100:+.1f}%")),
+        ("Earnings Growth", ("N/A" if earn_g is None else f"{earn_g*100:+.1f}%")),
+        ("Profit Margin",   ("N/A" if pm     is None else f"{pm*100:.1f}%")),
+        ("ROE",             ("N/A" if fund2.get("roe")           is None else f"{fund2['roe']*100:.1f}%")),
+        ("Current Ratio",   _fmt_float(fund2.get("current_ratio"), 2)),
+        ("D/E",             _fmt_float(fund2.get("debt_to_equity"), 2)),
+    ]
+    for i, (lbl, val) in enumerate(r2_data):
+        with r2_cols[i]:
+            st.metric(label=lbl, value=val)
+
+    # Row 3 — Institutional & Analyst
+    st.caption("Institutional & Analyst")
+    r3_cols = st.columns(6)
+    inst_p     = fund2.get("inst_ownership_pct")
+    spf        = fund2.get("short_pct_float")
+    beat_rate  = fund2.get("earnings_beat_rate")
+    tgt_price  = fund2.get("target_price")
+    r3_data = [
+        ("Inst. Ownership", ("N/A" if inst_p    is None else f"{inst_p*100:.1f}%")),
+        ("Short % Float",   ("N/A" if spf       is None else f"{spf*100:.1f}%" if spf < 1.0 else f"{spf:.1f}%")),
+        ("Short Ratio",     _fmt_float(fund2.get("short_ratio"), 1, "d")),
+        ("Analyst Rec.",    (fund2.get("recommendation") or "N/A").title()),
+        ("Target Price",    _fmt_price(tgt_price)),
+        ("EPS Beat Rate",   ("N/A" if beat_rate is None else f"{beat_rate*100:.0f}%")),
+    ]
+    for i, (lbl, val) in enumerate(r3_data):
+        with r3_cols[i]:
+            st.metric(label=lbl, value=val)
+
+    # Fundamental score banner
+    fscore_color = GREEN if fund_signal == "Bullish" else (RED if fund_signal == "Bearish" else NEUTRAL)
+    reasons_str  = " + ".join(fund_reasons) if fund_reasons else "—"
+    sign_char    = "+" if fund_score > 0 else ""
+    st.markdown(
+        f'<div style="background:{BG2};border:1px solid {fscore_color};border-radius:6px;'
+        f'padding:8px 14px;margin:6px 0">'
+        f'<span style="font-size:1.1rem;font-weight:bold;color:{fscore_color}">'
+        f'Fundamental Score: {sign_char}{fund_score} / {fund_signal.upper()}'
+        f'</span>'
+        f'<span style="color:{NEUTRAL};font-size:0.85rem;margin-left:12px">{reasons_str}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Short squeeze alert
+    if squeeze_info.get("is_squeeze_candidate"):
+        spf_disp  = fund2.get("short_pct_float")
+        spf_pct   = (spf_disp * 100 if spf_disp is not None and spf_disp < 1.0
+                     else (spf_disp or 0))
+        sr_disp   = fund2.get("short_ratio") or 0
+        sq_score  = squeeze_info["squeeze_score"]
+        st.warning(
+            f"SHORT SQUEEZE CANDIDATE — "
+            f"Short Float: {spf_pct:.1f}% | "
+            f"Short Ratio: {sr_disp:.1f}d | "
+            f"Squeeze Score: {sq_score}"
+        )
 
     st.divider()
 
@@ -1402,144 +1500,205 @@ def _render_portfolio_tab():
     st.divider()
 
     # ── NEW ORDER PANEL ───────────────────────────────────────────────────────
-    col_order, col_risk = st.columns([1, 1])
+    st.markdown(
+        f'<span style="color:{NEUTRAL};font-size:0.75rem;font-weight:bold">'
+        f'NEW PAPER ORDER</span>',
+        unsafe_allow_html=True,
+    )
 
-    with col_order:
-        st.markdown(
-            f'<span style="color:{NEUTRAL};font-size:0.75rem;font-weight:bold">'
-            f'NEW PAPER ORDER</span>',
-            unsafe_allow_html=True,
+    # Show pending order confirmation if one is queued
+    if st.session_state.pending_order:
+        po = st.session_state.pending_order
+        lp_str  = f"  |  Limit ${po['limit_price']:.2f}"  if po.get("limit_price") else ""
+        sp_str  = f"  |  Stop ${po['stop_price']:.2f}"    if po.get("stop_price")  else ""
+        est_val = (po.get("limit_price") or po.get("stop_price") or 0) * po["qty"]
+        est_str = f"  |  Est. value ${est_val:,.2f}" if est_val else ""
+        st.warning(
+            f"Confirm:  **{po['side'].upper()}  {po['qty']} shares  {po['ticker']}**  "
+            f"|  {po['order_type'].upper()}{lp_str}{sp_str}{est_str}"
         )
-
-        # Show pending order confirmation if one is queued
-        if st.session_state.pending_order:
-            po = st.session_state.pending_order
-            st.warning(
-                f"Confirm: **{po['side'].upper()} {po['qty']} {po['ticker']}**  "
-                f"@ {po['order_type'].upper()}"
-                + (f"  (limit ${po.get('limit_price'):.2f})" if po.get("limit_price") else "")
-            )
-            conf_col, cancel_col = st.columns(2)
-            with conf_col:
-                if st.button("✓ Confirm Order", key="order_confirm", width="stretch"):
-                    result = place_order(
+        conf_col, cancel_col = st.columns(2)
+        with conf_col:
+            if st.button("✓ Confirm Order", key="order_confirm", use_container_width=True):
+                result = place_order(
+                    ticker      = po["ticker"],
+                    qty         = po["qty"],
+                    side        = po["side"],
+                    order_type  = po["order_type"],
+                    limit_price = po.get("limit_price"),
+                )
+                st.session_state.pending_order = None
+                if result.get("error"):
+                    st.error(f"Order failed: {result['error']}")
+                else:
+                    log_trade(
                         ticker      = po["ticker"],
+                        entry_price = po.get("limit_price") or po.get("stop_price") or 0.0,
                         qty         = po["qty"],
                         side        = po["side"],
-                        order_type  = po["order_type"],
-                        limit_price = po.get("limit_price"),
+                        strategy_notes = f"Paper order via dashboard. ID: {result.get('id','')}",
                     )
-                    st.session_state.pending_order = None
-                    if result.get("error"):
-                        st.error(f"Order failed: {result['error']}")
-                    else:
-                        log_trade(
-                            ticker      = po["ticker"],
-                            entry_price = po.get("limit_price") or 0.0,
-                            qty         = po["qty"],
-                            side        = po["side"],
-                            strategy_notes = f"Paper order via dashboard. ID: {result.get('id','')}",
-                        )
-                        cached_orders.clear()
-                        cached_account.clear()
-                        st.success(
-                            f"Order submitted! ID: {result.get('id','')[:8]}…  "
-                            f"Status: {result.get('status','')}"
-                        )
-                        st.rerun()
-            with cancel_col:
-                if st.button("✕ Cancel", key="order_cancel", width="stretch"):
-                    st.session_state.pending_order = None
+                    cached_orders.clear()
+                    cached_account.clear()
+                    st.success(
+                        f"Order submitted! ID: {result.get('id','')[:8]}…  "
+                        f"Status: {result.get('status','')}"
+                    )
                     st.rerun()
-        else:
-            with st.form("new_order_form", clear_on_submit=False):
-                form_ticker = st.text_input(
-                    "Ticker", value=st.session_state.selected_ticker.upper(),
-                    placeholder="AAPL"
-                ).upper().strip()
-                form_qty  = st.number_input("Shares", min_value=1, value=10, step=1)
-                form_side = st.selectbox("Side", ["buy", "sell"])
-                form_type = st.selectbox("Order Type", ["market", "limit"])
-                form_lp   = None
-                if form_type == "limit":
-                    form_lp = st.number_input("Limit Price", min_value=0.01,
-                                              value=100.00, step=0.01, format="%.2f")
-                submitted = st.form_submit_button("Preview Order", use_container_width=True)
+        with cancel_col:
+            if st.button("✕ Cancel", key="order_cancel", use_container_width=True):
+                st.session_state.pending_order = None
+                st.rerun()
+    else:
+        # ── Order form — all fields stacked vertically, no columns ────────────
+        # Live price for default limit/stop value
+        _live_price = 100.0
+        try:
+            _md = cached_market_data(st.session_state.selected_ticker)
+            _live_price = float(_md.get("price_yf", {}).get("price") or 100.0)
+        except Exception:
+            pass
 
-            if submitted and form_ticker:
-                # Validate before queuing
-                acct_data = cached_account()
-                pos_data  = cached_positions() if not acct_data.get("error") else []
-                v = validate_trade(
-                    ticker        = form_ticker,
-                    side          = form_side,
-                    account_value = acct_data.get("portfolio_value", 0),
-                    buying_power  = acct_data.get("buying_power", 0),
-                    positions     = pos_data,
-                )
-                for w in v.get("warnings", []):
-                    st.warning(w)
-                for e in v.get("errors", []):
-                    st.error(e)
-                if v["valid"]:
-                    st.session_state.pending_order = {
-                        "ticker":      form_ticker,
-                        "qty":         int(form_qty),
-                        "side":        form_side,
-                        "order_type":  form_type,
-                        "limit_price": form_lp,
-                    }
-                    st.rerun()
+        form_ticker = st.text_input(
+            "Ticker",
+            value=st.session_state.selected_ticker.upper(),
+            placeholder="AAPL",
+            key="of_ticker",
+        ).upper().strip()
 
-    with col_risk:
+        form_qty = st.number_input(
+            "Shares", min_value=1, value=10, step=1, key="of_qty"
+        )
+
+        form_side = st.selectbox(
+            "Side", ["buy", "sell"], key="of_side"
+        )
+
+        form_type = st.selectbox(
+            "Order Type",
+            ["market", "limit", "stop", "stop_limit"],
+            key="of_type",
+        )
+
+        # Conditional price inputs — rendered outside any form so they
+        # appear immediately when order type changes
+        form_lp = None
+        form_sp = None
+
+        if form_type in ("limit", "stop_limit"):
+            form_lp = st.number_input(
+                "Limit Price ($)",
+                min_value=0.01,
+                value=round(_live_price, 2),
+                step=0.01,
+                format="%.2f",
+                key="of_limit_price",
+            )
+
+        if form_type in ("stop", "stop_limit"):
+            form_sp = st.number_input(
+                "Stop Price ($)",
+                min_value=0.01,
+                value=round(_live_price * 0.98, 2),
+                step=0.01,
+                format="%.2f",
+                key="of_stop_price",
+            )
+
+        # Full-width green Place Order button
         st.markdown(
-            f'<span style="color:{NEUTRAL};font-size:0.75rem;font-weight:bold">'
-            f'RISK CALCULATOR</span>',
+            '<style>'
+            'div[data-testid="stButton"]:has(button[kind="primary"]) button {'
+            '  background-color: #00ff88 !important;'
+            '  color: #0e1117 !important;'
+            '  font-weight: bold !important;'
+            '}'
+            '</style>',
             unsafe_allow_html=True,
         )
-        rc_ticker  = st.text_input(
-            "Ticker", value=st.session_state.selected_ticker.upper(),
-            key="rc_ticker", placeholder="AAPL"
-        ).upper().strip()
-        rc_entry   = st.number_input("Entry Price ($)", min_value=0.01,
-                                     value=150.00, step=0.01, format="%.2f", key="rc_entry")
-        rc_side    = st.selectbox("Side", ["buy", "sell"], key="rc_side")
-        rc_risk    = st.slider("Risk % of Account", 0.25, 5.0, 1.0, step=0.25, key="rc_risk")
-        rc_rr      = st.slider("Reward:Risk Ratio", 1.0, 5.0, 2.0, step=0.5, key="rc_rr")
+        place_clicked = st.button(
+            "Place Order",
+            key="of_submit",
+            use_container_width=True,
+            type="primary",
+        )
 
-        if st.button("Calculate", key="rc_calc", width="stretch"):
-            with st.spinner("Fetching ATR…"):
-                rc_stop   = calculate_stop_loss(rc_ticker, rc_entry, rc_side)
-                rc_target = calculate_take_profit(rc_entry, rc_stop, rc_side, rc_rr)
-                acct_data = cached_account()
-                acct_val  = acct_data.get("portfolio_value", 100_000)
-                rc_shares = calculate_position_size(acct_val, rc_risk, rc_entry, rc_stop)
+        if place_clicked and form_ticker:
+            acct_data = cached_account()
+            pos_data  = cached_positions() if not acct_data.get("error") else []
+            v = validate_trade(
+                ticker        = form_ticker,
+                side          = form_side,
+                account_value = acct_data.get("portfolio_value", 0),
+                buying_power  = acct_data.get("buying_power", 0),
+                positions     = pos_data,
+            )
+            for w in v.get("warnings", []):
+                st.warning(w)
+            for e in v.get("errors", []):
+                st.error(e)
+            if v["valid"]:
+                st.session_state.pending_order = {
+                    "ticker":      form_ticker,
+                    "qty":         int(form_qty),
+                    "side":        form_side,
+                    "order_type":  form_type,
+                    "limit_price": form_lp,
+                    "stop_price":  form_sp,
+                }
+                st.rerun()
 
-            if rc_stop and rc_target:
-                stop_pct  = abs(rc_entry - rc_stop) / rc_entry * 100
-                tgt_pct   = abs(rc_target - rc_entry) / rc_entry * 100
-                stop_c    = RED  if rc_side == "buy" else GREEN
-                tgt_c     = GREEN if rc_side == "buy" else RED
-                st.markdown(
-                    f'<div style="font-family:monospace;font-size:0.82rem;'
-                    f'line-height:1.8;background:#1a1d24;padding:10px;border-radius:5px">'
-                    f'<b style="color:{NEUTRAL}">Entry</b>&nbsp;&nbsp;&nbsp;'
-                    f'${rc_entry:.2f}<br>'
-                    f'<b style="color:{stop_c}">Stop</b>&nbsp;&nbsp;&nbsp;&nbsp;'
-                    f'${rc_stop:.2f}'
-                    f'<span style="color:{NEUTRAL}"> ({stop_pct:.1f}%)</span><br>'
-                    f'<b style="color:{tgt_c}">Target</b>&nbsp;&nbsp;'
-                    f'${rc_target:.2f}'
-                    f'<span style="color:{NEUTRAL}"> ({tgt_pct:.1f}%)</span><br>'
-                    f'<b style="color:{BLUE}">Shares</b>&nbsp;&nbsp;'
-                    f'{rc_shares} @ {rc_risk:.2f}% risk<br>'
-                    f'<b style="color:{NEUTRAL}">$ Risk</b>&nbsp;&nbsp;&nbsp;'
-                    f'${acct_val * rc_risk / 100:,.0f}'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.caption("Enter valid ticker and prices to calculate.")
+    st.divider()
+
+    # ── RISK CALCULATOR ───────────────────────────────────────────────────────
+    st.markdown(
+        f'<span style="color:{NEUTRAL};font-size:0.75rem;font-weight:bold">'
+        f'RISK CALCULATOR</span>',
+        unsafe_allow_html=True,
+    )
+    rc_ticker  = st.text_input(
+        "Ticker", value=st.session_state.selected_ticker.upper(),
+        key="rc_ticker", placeholder="AAPL"
+    ).upper().strip()
+    rc_entry   = st.number_input("Entry Price ($)", min_value=0.01,
+                                 value=150.00, step=0.01, format="%.2f", key="rc_entry")
+    rc_side    = st.selectbox("Side", ["buy", "sell"], key="rc_side")
+    rc_risk    = st.slider("Risk % of Account", 0.25, 5.0, 1.0, step=0.25, key="rc_risk")
+    rc_rr      = st.slider("Reward:Risk Ratio", 1.0, 5.0, 2.0, step=0.5, key="rc_rr")
+
+    if st.button("Calculate", key="rc_calc", use_container_width=True):
+        with st.spinner("Fetching ATR…"):
+            rc_stop   = calculate_stop_loss(rc_ticker, rc_entry, rc_side)
+            rc_target = calculate_take_profit(rc_entry, rc_stop, rc_side, rc_rr)
+            acct_data = cached_account()
+            acct_val  = acct_data.get("portfolio_value", 100_000)
+            rc_shares = calculate_position_size(acct_val, rc_risk, rc_entry, rc_stop)
+
+        if rc_stop and rc_target:
+            stop_pct  = abs(rc_entry - rc_stop) / rc_entry * 100
+            tgt_pct   = abs(rc_target - rc_entry) / rc_entry * 100
+            stop_c    = RED   if rc_side == "buy" else GREEN
+            tgt_c     = GREEN if rc_side == "buy" else RED
+            st.markdown(
+                f'<div style="font-family:monospace;font-size:0.82rem;'
+                f'line-height:1.8;background:#1a1d24;padding:10px;border-radius:5px">'
+                f'<b style="color:{NEUTRAL}">Entry</b>&nbsp;&nbsp;&nbsp;'
+                f'${rc_entry:.2f}<br>'
+                f'<b style="color:{stop_c}">Stop</b>&nbsp;&nbsp;&nbsp;&nbsp;'
+                f'${rc_stop:.2f}'
+                f'<span style="color:{NEUTRAL}"> ({stop_pct:.1f}%)</span><br>'
+                f'<b style="color:{tgt_c}">Target</b>&nbsp;&nbsp;'
+                f'${rc_target:.2f}'
+                f'<span style="color:{NEUTRAL}"> ({tgt_pct:.1f}%)</span><br>'
+                f'<b style="color:{BLUE}">Shares</b>&nbsp;&nbsp;'
+                f'{rc_shares} @ {rc_risk:.2f}% risk<br>'
+                f'<b style="color:{NEUTRAL}">$ Risk</b>&nbsp;&nbsp;&nbsp;'
+                f'${acct_val * rc_risk / 100:,.0f}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.caption("Enter valid ticker and prices to calculate.")
 
     st.divider()
 
