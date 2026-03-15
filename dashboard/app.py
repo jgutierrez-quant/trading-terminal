@@ -802,18 +802,33 @@ def _render_market_tab(selected: str):
     price_yf = data.get("price_yf")     or {}
     quote    = data.get("quote")         or {}
 
-    live_price = data.get("live_price")
-    change_pct = data.get("change_pct")
-    prev_close = price_yf.get("prev_close") or quote.get("prev_close")
-    short_name = fund.get("short_name") or selected
-    sector     = fund.get("sector") or ""
-    industry   = fund.get("industry") or ""
+    live_price   = data.get("live_price")
+    change_pct   = data.get("change_pct")
+    price_source = data.get("price_source")   # "alpaca" | "polygon" | "yfinance" | None
+    prev_close   = price_yf.get("prev_close") or quote.get("prev_close")
+    short_name   = fund.get("short_name") or selected
+    sector       = fund.get("sector") or ""
+    industry     = fund.get("industry") or ""
 
     price_str = _fmt_price(live_price)
     chg_str   = _fmt_pct(change_pct)
     prev_str  = _fmt_price(prev_close)
     chg_c     = _chg_color(change_pct)
     sub_str   = " — ".join(filter(None, [short_name, sector, industry]))
+
+    # Data source badge
+    if price_source == "alpaca":
+        src_label = "Alpaca Live"
+        src_color = GREEN
+    elif price_source == "polygon":
+        src_label = "Polygon EOD"
+        src_color = YELLOW
+    elif price_source == "yfinance":
+        src_label = "yfinance Delayed"
+        src_color = NEUTRAL
+    else:
+        src_label = "No Price"
+        src_color = RED
 
     # ── PRICE HEADER ──────────────────────────────────────────────────────────
     ph_left, ph_right = st.columns([6, 2])
@@ -823,6 +838,10 @@ def _render_market_tab(selected: str):
             f'<span style="font-size:2.2rem;font-weight:bold">{price_str}</span>'
             f'&nbsp;&nbsp;'
             f'<span style="font-size:1.5rem;font-weight:bold;color:{chg_c}">{chg_str}</span>'
+            f'&nbsp;&nbsp;'
+            f'<span style="font-size:0.72rem;color:{src_color};font-family:monospace;'
+            f'border:1px solid {src_color};border-radius:3px;padding:1px 5px">'
+            f'{src_label}</span>'
             f'<br>'
             f'<span style="font-size:0.85rem;color:{NEUTRAL}">'
             f'Prev close: {prev_str} &nbsp;|&nbsp; {sub_str}'
