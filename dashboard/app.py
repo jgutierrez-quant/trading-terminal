@@ -135,10 +135,11 @@ def cached_technicals(ticker: str) -> dict:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_anomaly(ticker: str) -> dict:
-    """Calls cached_technicals + cached_sentiment — avoids duplicate API calls."""
+    """Calls cached_technicals + cached_sentiment — avoids duplicate API calls.
+    Enables earnings proximity and sector momentum checks for the dashboard view."""
     tech = cached_technicals(ticker)
     sent = cached_sentiment(ticker)
-    return compute_anomaly(ticker, tech, sent)
+    return compute_anomaly(ticker, tech, sent, check_earnings=True, check_sector=True)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -261,8 +262,11 @@ def cached_market_scan() -> list:
             tech = cached_technicals(ticker)   # uses Streamlit cache
             if tech.get("error"):
                 continue
+            # check_earnings/check_sector disabled — too slow for 75-ticker scan
             anomaly = compute_anomaly(ticker, tech, mock_sent)
             if not anomaly.get("is_watch"):
+                continue
+            if anomaly.get("quality_score", 0) < 60:
                 continue
             pi = price_map.get(ticker, {})
             row = dict(anomaly)
@@ -272,7 +276,8 @@ def cached_market_scan() -> list:
         except Exception:
             continue
 
-    results.sort(key=lambda r: r["score"], reverse=True)
+    # Stage 9: sort by quality_score (was raw score)
+    results.sort(key=lambda r: r.get("quality_score", 0), reverse=True)
     return results
 
 
@@ -899,14 +904,38 @@ def _render_market_tab(selected: str):
     st.markdown(badges_html, unsafe_allow_html=True)
 
     an_data = cached_anomaly(selected)
+
+    # Earnings proximity warning
+    if an_data.get("earnings_proximity"):
+        earn_date = an_data.get("earnings_date", "")
+        st.warning(
+            f"⚠️ Earnings within 5 days"
+            + (f" ({earn_date})" if earn_date else "")
+            + " — consider avoiding new positions.",
+            icon=None,
+        )
+
     if an_data.get("is_watch"):
+        direction  = an_data.get("direction", "")
+        dir_color  = GREEN if direction == "Long" else RED
+        dir_badge  = (
+            f'<span style="background:{dir_color}22;border:1px solid {dir_color};'
+            f'border-radius:3px;padding:1px 7px;font-size:0.78rem;'
+            f'color:{dir_color};font-weight:bold">{direction}</span>&nbsp;'
+            if direction else ""
+        )
         st.markdown(
             f'<div style="background:#ffd70018;border:1px solid {YELLOW};'
-            f'border-radius:5px;padding:8px 14px;margin-bottom:12px;'
+            f'border-radius:5px;padding:8px 14px;margin-bottom:6px;'
             f'font-size:0.85rem;color:{YELLOW}">'
-            f'🔥 <b>Watch:</b> {an_data.get("reason", "")}'
+            f'🔥 <b>Watch:</b> {dir_badge}{an_data.get("reason", "")}'
             f'</div>',
             unsafe_allow_html=True,
+        )
+        q_score = an_data.get("quality_score", 0)
+        st.progress(
+            q_score / 100,
+            text=f"Signal Quality: {q_score}/100",
         )
 
     # Tabbed charts
@@ -1149,7 +1178,7 @@ def _render_screener_tab():
         # Column header strip (HTML — no buttons)
         st.markdown(
             '<div style="display:grid;'
-            'grid-template-columns:85px 75px 70px 55px 1fr 88px;'
+            'grid-template-columns:85px 75px 70px 55px 55px 1fr 88px;'
             'gap:4px;padding:5px 0 3px 0;'
             'font-size:0.7rem;color:#555;font-weight:bold;'
             'border-bottom:1px solid #2a2d35;font-family:monospace">'
@@ -1157,6 +1186,7 @@ def _render_screener_tab():
             '<span>PRICE</span>'
             '<span>CHG%</span>'
             '<span>SCORE</span>'
+            '<span>DIR</span>'
             '<span>SIGNALS / REASON</span>'
             '<span></span>'
             '</div>',
@@ -1164,29 +1194,23 @@ def _render_screener_tab():
         )
 
         for row in scan_results:
-            ticker   = row["ticker"]
-            score    = row.get("score", 0)
-            reason   = row.get("reason", "—")
-            price    = row.get("price")
-            chg      = row.get("change_pct")
-            in_wl    = ticker in watchlist
+            ticker    = row["ticker"]
+            score     = row.get("score", 0)
+            reason    = row.get("reason", "—")
+            price     = row.get("price")
+            chg       = row.get("change_pct")
+            direction = row.get("direction", "")
+            in_wl     = ticker in watchlist
 
-            # Row accent colour based on signal bias
-            signals   = row.get("signals", [])
-            bull_n    = sum(1 for s in signals
-                            if any(k in s for k in
-                                   ["Bullish", "Oversold", "Above VWAP", "Above MA", "BB Oversold"]))
-            bear_n    = sum(1 for s in signals
-                            if any(k in s for k in
-                                   ["Bearish", "Overbought", "Below VWAP", "Below MA", "BB Overbought"]))
-            accent    = GREEN if bull_n > bear_n else (RED if bear_n > bull_n else YELLOW)
-            score_c   = GREEN if score >= 5 else (YELLOW if score >= 3 else NEUTRAL)
+            dir_color = GREEN if direction == "Long" else (RED if direction == "Short" else NEUTRAL)
+            accent    = dir_color
+            score_c   = GREEN if score >= 5 else (YELLOW if score >= 4 else NEUTRAL)
             chg_c     = GREEN if (chg or 0) >= 0 else RED
             price_str = f"${price:.2f}" if price else "N/A"
             chg_str   = f"{chg:+.2f}%" if chg is not None else "N/A"
 
             # One st.columns() strip per row — required for st.button in last column
-            c1, c2, c3, c4, c5, c6 = st.columns([1.1, 1, 0.9, 0.7, 4.2, 1.1])
+            c1, c2, c3, c4, c4b, c5, c6 = st.columns([1.1, 1, 0.9, 0.7, 0.7, 4.2, 1.1])
 
             with c1:
                 fire = " 🔥" if row.get("is_watch") else ""
@@ -1209,6 +1233,12 @@ def _render_screener_tab():
                 st.markdown(
                     f'<span style="color:{score_c};font-weight:bold;'
                     f'font-size:0.9rem">{score}</span>',
+                    unsafe_allow_html=True,
+                )
+            with c4b:
+                st.markdown(
+                    f'<span style="color:{dir_color};font-weight:bold;'
+                    f'font-size:0.82rem">{direction}</span>',
                     unsafe_allow_html=True,
                 )
             with c5:
@@ -1680,14 +1710,19 @@ def render():
                         st.session_state.selected_ticker = remaining[0] if remaining else "AAPL"
                     st.rerun()
 
+            q_score = an.get("quality_score", 0)
             badge_html = (
                 f'<span style="color:{label_c};font-size:0.72rem">{fast_label}</span>'
                 f'<span style="color:{NEUTRAL};font-size:0.68rem;margin-left:6px">'
-                f'[{a_score} sig]</span>'
+                f'[{a_score} sig] [Q:{q_score}]</span>'
             )
             if is_watch and reason:
+                direction  = an.get("direction", "")
+                dir_color  = GREEN if direction == "Long" else RED
+                dir_txt    = (f'<span style="color:{dir_color};font-size:0.65rem">'
+                              f'{direction}</span> ' if direction else "")
                 badge_html += (
-                    f'<br><span style="color:{YELLOW};font-size:0.65rem">'
+                    f'<br>{dir_txt}<span style="color:{YELLOW};font-size:0.65rem">'
                     f'{reason[:50]}{"..." if len(reason)>50 else ""}</span>'
                 )
             st.markdown(badge_html, unsafe_allow_html=True)

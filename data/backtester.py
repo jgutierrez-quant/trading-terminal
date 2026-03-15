@@ -4,29 +4,29 @@ across 2 years of daily data, simulates entries/exits with ATR-based
 risk management, and returns structured results for the Backtest tab.
 
 Public API:
-    get_historical_data(ticker, period='2y')  -> pd.DataFrame
-    generate_signals(df)                       -> pd.DataFrame
+    get_historical_data(ticker, period='2y')   -> pd.DataFrame
+    generate_signals(df, watch_threshold=4)    -> pd.DataFrame
     run_backtest(ticker, ...)                  -> dict
     run_multi_backtest(tickers, ...)           -> pd.DataFrame
 
-CRITICAL: Signal logic mirrors data/technicals.py and data/anomaly_detector.py EXACTLY.
-    RSI:    gain.ewm(com=13, min_periods=14).mean()  (Wilder's smoothing)
-    MACD:   EWM span=12/26/9, adjust=False
-    BB:     rolling(20).mean() +/- 2.0 * rolling(20).std(ddof=0)
-    Volume: volume / volume.rolling(20).mean().shift(1)   <- shift avoids look-ahead
-    SMA:    rolling(20/50).mean()
-    VWAP:   (High + Low + Close) / 3  (daily PROXY — see note below)
-    Watch threshold: score >= 3  (same as WATCH_THRESHOLD in anomaly_detector.py)
+Stage 9 changes vs Stage 8B:
+    - WATCH_THRESHOLD raised to 4 (matches anomaly_detector.py)
+    - Direction filter: Long only when price > SMA50; Short only below SMA50
+    - Quality score (0-100) computed vectorized and stored per bar
+    - quality_threshold parameter (default 60) — skip low-quality setups
+    - hold_days default raised from 5 to 10
+    - MA20 trend-invalidation exit: exit if price crosses MA20 against position
+    - Earnings avoidance: skip entry if earnings within 5 days
+    - watch_threshold parameter for threshold 3 vs 4 comparison
+    - New metrics: avg_hold_days, exit_breakdown (% by method)
 
-NOTE ON VWAP PROXY:
-    Live code computes VWAP from intraday 1-minute bars (cumulative TP*Vol / cumVol).
-    That data is not available in historical mode. This module uses the daily typical
-    price (H+L+C)/3 as an approximation. Signals derived from vwap_proxy will differ
-    from live VWAP signals, especially intra-day.
+Signal formulas are IDENTICAL to data/technicals.py and anomaly_detector.py.
+⚠️ VWAP proxy: daily (H+L+C)/3 — NOT intraday VWAP.
 """
 
 import math
 import logging
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -34,14 +34,14 @@ import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
-# ── Constants — must match anomaly_detector.py and utils/risk_manager.py ────────
-WATCH_THRESHOLD  = 3
+# ── Constants (match anomaly_detector.py Stage 9) ────────────────────────────
+WATCH_THRESHOLD  = 4
 ATR_PERIOD       = 14
 ATR_MULTIPLIER   = 2.0
 MAX_POSITION_PCT = 0.20
 
 
-# ── Private indicator helpers — identical formulas to technicals.py ─────────────
+# ── Private indicator helpers — identical to technicals.py ───────────────────
 
 def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta    = close.diff()
@@ -76,7 +76,7 @@ def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) ->
     return tr.rolling(period).mean()
 
 
-# ── Public functions ─────────────────────────────────────────────────────────────
+# ── Public functions ──────────────────────────────────────────────────────────
 
 def get_historical_data(ticker: str, period: str = '2y') -> pd.DataFrame:
     """
@@ -87,7 +87,7 @@ def get_historical_data(ticker: str, period: str = '2y') -> pd.DataFrame:
         rsi, macd_hist, bb_upper, bb_lower,
         sma20, sma50, vol_ratio, atr, vwap_proxy
 
-    Raises ValueError if data is insufficient (< 60 bars).
+    ⚠️ VWAP proxy: (High+Low+Close)/3 — daily approximation, NOT intraday VWAP.
     """
     ticker = ticker.upper()
     df = yf.Ticker(ticker).history(period=period, interval='1d')
@@ -102,79 +102,63 @@ def get_historical_data(ticker: str, period: str = '2y') -> pd.DataFrame:
     low    = df['Low']
     volume = df['Volume']
 
-    # RSI — identical EWM (Wilder's smoothing) to technicals.py
-    df['rsi'] = _rsi(close, 14)
-
-    # MACD — EWM span=12/26/9, adjust=False (identical to technicals.py)
-    _, _, hist = _macd(close, 12, 26, 9)
-    df['macd_hist'] = hist
-
-    # Bollinger Bands — rolling(20), ddof=0 (identical to technicals.py)
+    df['rsi']        = _rsi(close, 14)
+    _, _, hist       = _macd(close, 12, 26, 9)
+    df['macd_hist']  = hist
     bb_upper, _, bb_lower = _bbands(close, 20, 2.0)
-    df['bb_upper'] = bb_upper
-    df['bb_lower'] = bb_lower
-
-    # SMA 20 / 50
-    df['sma20'] = close.rolling(20).mean()
-    df['sma50'] = close.rolling(50).mean()
-
-    # Volume ratio — shift(1) avoids look-ahead bias (vectorized equivalent of
-    # vol.iloc[-21:-1].mean() used in technicals.py for the single-bar case)
-    df['vol_ratio'] = volume / volume.rolling(20).mean().shift(1)
-
-    # ATR 14-period for stop-loss sizing (same formula as risk_manager.py)
-    df['atr'] = _atr(high, low, close, 14)
-
-    # VWAP proxy — daily typical price (NOT intraday VWAP)
-    # ⚠️  Live code: cumulative (TP * Vol) / cumVol from 1-min bars.
-    #     This is a daily approximation only — signals will differ from live.
+    df['bb_upper']   = bb_upper
+    df['bb_lower']   = bb_lower
+    df['sma20']      = close.rolling(20).mean()
+    df['sma50']      = close.rolling(50).mean()
+    df['vol_ratio']  = volume / volume.rolling(20).mean().shift(1)
+    df['atr']        = _atr(high, low, close, 14)
     df['vwap_proxy'] = (high + low + close) / 3
 
     return df
 
 
-def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
+def generate_signals(df: pd.DataFrame, watch_threshold: int = WATCH_THRESHOLD) -> pd.DataFrame:
     """
-    Apply all signal conditions vectorized, matching anomaly_detector.py exactly.
+    Apply all signal conditions vectorized — matches anomaly_detector.py exactly.
+
+    Stage 9 additions:
+        - quality_score: 0-100 per bar
+        - Direction filter: watch_flag requires direction to agree with SMA50 trend
+        - direction: 'Bullish', 'Bearish', or 'Filtered' (direction/trend mismatch)
 
     Adds columns:
         rsi_signal, macd_signal, bb_signal, vol_signal,
         vwap_signal, price_vs_sma20, price_vs_sma50,
-        signal_count, signal_list, watch_flag, direction
+        signal_count, signal_list, quality_score,
+        direction, watch_flag
     """
     close = df['Close']
 
-    # ── RSI ───────────────────────────────────────────────────────────────────
+    # ── Signal labels ─────────────────────────────────────────────────────────
     df['rsi_signal'] = np.where(df['rsi'] < 30, 'Oversold',
                        np.where(df['rsi'] > 70, 'Overbought', 'Neutral'))
 
-    # ── MACD — sign-change detection (matches prv_hist/cur_hist logic) ────────
     prv = df['macd_hist'].shift(1)
     cur = df['macd_hist']
     df['macd_signal'] = np.where(
         (prv < 0) & (cur >= 0), 'Bullish Cross',
-        np.where(
-            (prv > 0) & (cur <= 0), 'Bearish Cross',
+        np.where((prv > 0) & (cur <= 0), 'Bearish Cross',
             np.where(cur > 0, 'Bullish', 'Bearish')
         )
     )
 
-    # ── Bollinger Bands ───────────────────────────────────────────────────────
     df['bb_signal'] = np.where(close > df['bb_upper'], 'Above Upper',
                       np.where(close < df['bb_lower'], 'Below Lower', 'Inside Bands'))
 
-    # ── Volume ────────────────────────────────────────────────────────────────
     df['vol_signal'] = np.where(df['vol_ratio'] >= 2.0, 'High Volume',
                        np.where(df['vol_ratio'] >= 1.5, 'Elevated', 'Normal'))
 
-    # ── VWAP (proxy) ──────────────────────────────────────────────────────────
     df['vwap_signal'] = np.where(close > df['vwap_proxy'], 'Above VWAP', 'Below VWAP')
 
-    # ── SMA ───────────────────────────────────────────────────────────────────
     df['price_vs_sma20'] = np.where(close > df['sma20'], 'Above', 'Below')
     df['price_vs_sma50'] = np.where(close > df['sma50'], 'Above', 'Below')
 
-    # ── Signal count — identical scoring to anomaly_detector.py ──────────────
+    # ── Signal count ──────────────────────────────────────────────────────────
     rsi_ct  = df['rsi_signal'].isin(['Oversold', 'Overbought']).astype(int)
     macd_ct = df['macd_signal'].isin(['Bullish Cross', 'Bearish Cross']).astype(int)
     bb_ct   = df['bb_signal'].isin(['Above Upper', 'Below Lower']).astype(int)
@@ -184,59 +168,92 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
         ((df['price_vs_sma20'] == 'Above') & (df['price_vs_sma50'] == 'Above')) |
         ((df['price_vs_sma20'] == 'Below') & (df['price_vs_sma50'] == 'Below'))
     ).astype(int)
-
     df['signal_count'] = rsi_ct + macd_ct + bb_ct + vol_ct + vwap_ct + sma_ct
-    df['watch_flag']   = df['signal_count'] >= WATCH_THRESHOLD
 
-    # ── Signal list + direction (per-row apply — acceptable for ~500 rows) ────
-    def _signals_and_dir(row):
+    # ── Directional signal counts (for quality score and direction filter) ────
+    bull_ct = (
+        (df['rsi_signal'] == 'Oversold').astype(int) +
+        (df['macd_signal'] == 'Bullish Cross').astype(int) +
+        (df['bb_signal'] == 'Below Lower').astype(int) +
+        (df['vwap_signal'] == 'Above VWAP').astype(int) +
+        ((df['price_vs_sma20'] == 'Above') & (df['price_vs_sma50'] == 'Above')).astype(int)
+    )
+    bear_ct = (
+        (df['rsi_signal'] == 'Overbought').astype(int) +
+        (df['macd_signal'] == 'Bearish Cross').astype(int) +
+        (df['bb_signal'] == 'Above Upper').astype(int) +
+        (df['vwap_signal'] == 'Below VWAP').astype(int) +
+        ((df['price_vs_sma20'] == 'Below') & (df['price_vs_sma50'] == 'Below')).astype(int)
+    )
+
+    # ── Quality score (0-100) ─────────────────────────────────────────────────
+    dir_total  = bull_ct + bear_ct
+    dominant   = np.maximum(bull_ct, bear_ct)
+    alignment  = np.where(dir_total > 0, dominant / dir_total.replace(0, 1), 0.5)
+    vol_pts    = np.where(df['vol_signal'] == 'High Volume', 20,
+                 np.where(df['vol_signal'] == 'Elevated', 10, 0))
+    df['quality_score'] = (
+        np.minimum(df['signal_count'] / 6.0, 1.0) * 40 +
+        alignment * 40 +
+        vol_pts
+    ).round().astype(int)
+
+    # ── Direction with SMA50 filter ───────────────────────────────────────────
+    above_sma50 = close > df['sma50']
+    # Long: bullish dominates (or tied) AND price above SMA50
+    is_long  = (bull_ct >= bear_ct) & above_sma50
+    # Short: bearish dominates AND price below SMA50
+    is_short = (bear_ct > bull_ct) & ~above_sma50
+    direction_ok = is_long | is_short
+
+    df['direction'] = np.where(is_long,  'Bullish',
+                      np.where(is_short, 'Bearish', 'Filtered'))
+
+    # watch_flag requires threshold AND direction alignment with trend
+    df['watch_flag'] = (df['signal_count'] >= watch_threshold) & direction_ok
+
+    # ── Signal list (string per row) ──────────────────────────────────────────
+    def _signal_list(row):
         sigs = []
-        bull = 0
-        bear = 0
-
-        if row['rsi_signal'] == 'Oversold':
-            sigs.append('Oversold RSI');      bull += 1
-        elif row['rsi_signal'] == 'Overbought':
-            sigs.append('Overbought RSI');    bear += 1
-
-        if row['macd_signal'] == 'Bullish Cross':
-            sigs.append('Bullish MACD Cross'); bull += 1
-        elif row['macd_signal'] == 'Bearish Cross':
-            sigs.append('Bearish MACD Cross'); bear += 1
-
-        if row['bb_signal'] == 'Below Lower':
-            sigs.append('BB Oversold');       bull += 1
-        elif row['bb_signal'] == 'Above Upper':
-            sigs.append('BB Overbought');     bear += 1
-
-        if row['vol_signal'] == 'High Volume':
-            sigs.append('High Volume')
-        elif row['vol_signal'] == 'Elevated':
-            sigs.append('Elevated Volume')
-
-        if row['vwap_signal'] == 'Above VWAP':
-            sigs.append('Above VWAP');        bull += 1
-        elif row['vwap_signal'] == 'Below VWAP':
-            sigs.append('Below VWAP');        bear += 1
-
+        if row['rsi_signal'] == 'Oversold':      sigs.append('Oversold RSI')
+        elif row['rsi_signal'] == 'Overbought':  sigs.append('Overbought RSI')
+        if row['macd_signal'] == 'Bullish Cross':  sigs.append('Bullish MACD Cross')
+        elif row['macd_signal'] == 'Bearish Cross': sigs.append('Bearish MACD Cross')
+        if row['bb_signal'] == 'Below Lower':    sigs.append('BB Oversold')
+        elif row['bb_signal'] == 'Above Upper':  sigs.append('BB Overbought')
+        if row['vol_signal'] == 'High Volume':   sigs.append('High Volume')
+        elif row['vol_signal'] == 'Elevated':    sigs.append('Elevated Volume')
+        if row['vwap_signal'] == 'Above VWAP':   sigs.append('Above VWAP')
+        elif row['vwap_signal'] == 'Below VWAP': sigs.append('Below VWAP')
         if row['price_vs_sma20'] == 'Above' and row['price_vs_sma50'] == 'Above':
-            sigs.append('Price Above MA20+MA50'); bull += 1
+            sigs.append('Price Above MA20+MA50')
         elif row['price_vs_sma20'] == 'Below' and row['price_vs_sma50'] == 'Below':
-            sigs.append('Price Below MA20+MA50'); bear += 1
+            sigs.append('Price Below MA20+MA50')
+        return ', '.join(sigs)
 
-        direction = (
-            'Bullish' if bull > bear else
-            'Bearish' if bear > bull else
-            'Mixed'   if sigs else
-            'Neutral'
-        )
-        return pd.Series({'signal_list': ', '.join(sigs), 'direction': direction})
-
-    _res = df.apply(_signals_and_dir, axis=1)
-    df['signal_list'] = _res['signal_list']
-    df['direction']   = _res['direction']
-
+    df['signal_list'] = df.apply(_signal_list, axis=1)
     return df
+
+
+def _fetch_earnings_dates(ticker: str) -> set:
+    """
+    Fetch historical + upcoming earnings dates for a ticker.
+    Returns a set of date strings ('YYYY-MM-DD'). Empty set on failure.
+    """
+    try:
+        ed = yf.Ticker(ticker).earnings_dates
+        if ed is None or ed.empty:
+            return set()
+        dates = set()
+        for dt in ed.index:
+            try:
+                dates.add(str(dt.date()) if hasattr(dt, 'date') else str(dt)[:10])
+            except Exception:
+                continue
+        return dates
+    except Exception as exc:
+        logger.debug("Could not fetch earnings dates for %s: %s", ticker, exc)
+        return set()
 
 
 def run_backtest(
@@ -244,39 +261,50 @@ def run_backtest(
     initial_capital: float = 1000,
     risk_percent: float = 2.0,
     risk_reward: float = 2.0,
-    hold_days: int = 5,
+    hold_days: int = 10,
+    quality_threshold: int = 60,
+    watch_threshold: int = WATCH_THRESHOLD,
+    check_earnings: bool = True,
 ) -> dict:
     """
     Sequential backtest with no look-ahead bias.
 
-    Algorithm:
-        Entry:  next-day Open after a watch_flag bar (entry bar = signal_bar + 1)
-        Stop:   entry +/- ATR[signal_bar] * 2.0
-        Target: entry +/- stop_distance * risk_reward
-        Exit priority: Stop hit -> Target hit -> Timeout at close after hold_days
-        No overlapping trades — loop advances past exit bar before scanning again.
+    Stage 9 changes:
+        - Direction filter (Long only above SMA50, Short only below)
+        - Quality score filter: skip trades below quality_threshold
+        - MA20 trend-invalidation exit (outcome = 'Trend')
+        - Earnings avoidance: skip entry within 5 days of earnings
+        - watch_threshold parameter for threshold-3 vs threshold-4 comparisons
+        - New metrics: avg_hold_days, exit_breakdown
 
-    Returns dict with keys:
-        ticker, trades, equity_curve, signal_history,
-        win_rate, avg_win_pct, avg_loss_pct, profit_factor,
-        total_return_pct, max_drawdown_pct, sharpe_ratio,
-        total_trades, best_trade, worst_trade,
-        final_capital, initial_capital, error
+    Exit priority per bar:
+        1. Stop hit (ATR x 2.0)
+        2. Target hit (stop_distance x risk_reward)
+        3. MA20 crossed against position (Trend invalidation)
+        4. Timeout at close after hold_days bars
     """
     try:
-        df = generate_signals(get_historical_data(ticker))
+        df = generate_signals(get_historical_data(ticker), watch_threshold=watch_threshold)
     except Exception as exc:
         logger.error("Backtest failed for %s: %s", ticker, exc)
         return _empty_result(ticker, str(exc), initial_capital)
 
+    # Earnings dates — fetched once, checked at each potential entry
+    earnings_dates = _fetch_earnings_dates(ticker) if check_earnings else set()
+
     capital       = float(initial_capital)
     trades        = []
-    equity_events = {}   # date_str -> capital after this exit
+    equity_events = {}
     n             = len(df)
     i             = 0
 
     while i < n - 1:
         if not df['watch_flag'].iloc[i]:
+            i += 1
+            continue
+
+        # Quality filter
+        if int(df['quality_score'].iloc[i]) < quality_threshold:
             i += 1
             continue
 
@@ -287,6 +315,18 @@ def run_backtest(
         if pd.isna(atr_val) or float(atr_val) <= 0 or entry_price <= 0:
             i += 1
             continue
+
+        # Earnings proximity check — skip if earnings within 5 days
+        if earnings_dates:
+            entry_dt    = df.index[entry_idx]
+            entry_ts    = pd.Timestamp(entry_dt.date() if hasattr(entry_dt, 'date') else str(entry_dt)[:10])
+            near_earn   = any(
+                abs((pd.Timestamp(ed) - entry_ts).days) <= 5
+                for ed in earnings_dates
+            )
+            if near_earn:
+                i += 1
+                continue
 
         atr_val   = float(atr_val)
         direction = str(df['direction'].iloc[i])
@@ -300,7 +340,6 @@ def run_backtest(
             stop   = entry_price + stop_dist
             target = entry_price - stop_dist * risk_reward
 
-        # Position sizing — identical to utils/risk_manager.calculate_position_size()
         dollar_risk = capital * (risk_percent / 100)
         shares      = int(math.floor(dollar_risk / stop_dist))
         max_shares  = int(math.floor(capital * MAX_POSITION_PCT / entry_price))
@@ -310,24 +349,32 @@ def run_backtest(
             i += 1
             continue
 
-        # Simulate exit: scan bars entry_idx .. entry_idx+hold_days (inclusive)
+        # Simulate exit
         exit_price = None
         exit_bar   = min(entry_idx + hold_days, n - 1)
         outcome    = 'Timeout'
 
         for j in range(entry_idx, exit_bar + 1):
-            bar_h = float(df['High'].iloc[j])
-            bar_l = float(df['Low'].iloc[j])
+            bar_h    = float(df['High'].iloc[j])
+            bar_l    = float(df['Low'].iloc[j])
+            bar_c    = float(df['Close'].iloc[j])
+            bar_sma20 = df['sma20'].iloc[j]
+            sma20_valid = not pd.isna(bar_sma20)
+
             if side == 'long':
                 if bar_l <= stop:
                     exit_price = stop;   exit_bar = j; outcome = 'Stop';   break
                 elif bar_h >= target:
                     exit_price = target; exit_bar = j; outcome = 'Target'; break
+                elif sma20_valid and bar_c < float(bar_sma20):
+                    exit_price = bar_c;  exit_bar = j; outcome = 'Trend';  break
             else:
                 if bar_h >= stop:
                     exit_price = stop;   exit_bar = j; outcome = 'Stop';   break
                 elif bar_l <= target:
                     exit_price = target; exit_bar = j; outcome = 'Target'; break
+                elif sma20_valid and bar_c > float(bar_sma20):
+                    exit_price = bar_c;  exit_bar = j; outcome = 'Trend';  break
 
         if exit_price is None:
             exit_price = float(df['Close'].iloc[exit_bar])
@@ -349,47 +396,49 @@ def run_backtest(
         equity_events[exit_date] = capital
 
         trades.append({
-            'entry_date':   entry_date,
-            'exit_date':    exit_date,
-            'entry_price':  round(entry_price, 4),
-            'exit_price':   round(exit_price,  4),
-            'shares':       shares,
-            'side':         side,
-            'pnl':          round(pnl, 2),
-            'pnl_pct':      round(pnl_pct, 2),
-            'outcome':      outcome,
-            'signals':      str(df['signal_list'].iloc[i]),
-            'signal_count': int(df['signal_count'].iloc[i]),
+            'entry_date':    entry_date,
+            'exit_date':     exit_date,
+            'entry_price':   round(entry_price, 4),
+            'exit_price':    round(exit_price,  4),
+            'shares':        shares,
+            'side':          side,
+            'pnl':           round(pnl, 2),
+            'pnl_pct':       round(pnl_pct, 2),
+            'outcome':       outcome,
+            'signals':       str(df['signal_list'].iloc[i]),
+            'signal_count':  int(df['signal_count'].iloc[i]),
+            'quality_score': int(df['quality_score'].iloc[i]),
         })
 
-        i = exit_bar + 1   # skip rows that were part of the completed trade
+        i = exit_bar + 1
 
-    # ── Equity curve — daily, forward-filled between exits ────────────────────
-    equity_curve  = []
-    current_eq    = float(initial_capital)
+    # ── Equity curve ──────────────────────────────────────────────────────────
+    equity_curve = []
+    current_eq   = float(initial_capital)
     for dt in df.index:
         date_str = str(dt.date()) if hasattr(dt, 'date') else str(dt)[:10]
         if date_str in equity_events:
             current_eq = equity_events[date_str]
         equity_curve.append((date_str, current_eq))
 
-    # ── Signal history for chart display ──────────────────────────────────────
+    # ── Signal history ────────────────────────────────────────────────────────
     signal_history = [
         {
-            'date':         str(dt.date()) if hasattr(dt, 'date') else str(dt)[:10],
-            'signal_count': int(df['signal_count'].iloc[k]),
-            'watch_flag':   bool(df['watch_flag'].iloc[k]),
+            'date':          str(dt.date()) if hasattr(dt, 'date') else str(dt)[:10],
+            'signal_count':  int(df['signal_count'].iloc[k]),
+            'watch_flag':    bool(df['watch_flag'].iloc[k]),
+            'quality_score': int(df['quality_score'].iloc[k]),
         }
         for k, dt in enumerate(df.index)
     ]
 
-    # ── Return empty metrics if no trades ────────────────────────────────────
+    # ── Empty result guard ────────────────────────────────────────────────────
     if not trades:
-        result = _empty_result(ticker, None, initial_capital)
-        result['equity_curve']   = equity_curve
-        result['signal_history'] = signal_history
-        result['final_capital']  = round(capital, 2)
-        return result
+        r = _empty_result(ticker, None, initial_capital)
+        r['equity_curve']   = equity_curve
+        r['signal_history'] = signal_history
+        r['final_capital']  = round(capital, 2)
+        return r
 
     # ── Metrics ───────────────────────────────────────────────────────────────
     wins         = [t for t in trades if t['pnl'] > 0]
@@ -409,10 +458,30 @@ def run_backtest(
     max_dd   = float(drawdown.min())
 
     eq_ret = eq_vals.pct_change().dropna()
-    if len(eq_ret) > 1 and eq_ret.std() > 0:
-        sharpe = float((eq_ret.mean() / eq_ret.std()) * (252 ** 0.5))
-    else:
-        sharpe = 0.0
+    sharpe = float((eq_ret.mean() / eq_ret.std()) * (252 ** 0.5)) if (
+        len(eq_ret) > 1 and eq_ret.std() > 0
+    ) else 0.0
+
+    # Average hold days
+    hold_days_list = []
+    for t in trades:
+        try:
+            d1 = datetime.strptime(t['entry_date'], '%Y-%m-%d')
+            d2 = datetime.strptime(t['exit_date'],  '%Y-%m-%d')
+            hold_days_list.append((d2 - d1).days)
+        except Exception:
+            pass
+    avg_hold_days = round(sum(hold_days_list) / len(hold_days_list), 1) if hold_days_list else 0.0
+
+    # Exit method breakdown
+    total = len(trades)
+    outcomes = [t['outcome'] for t in trades]
+    exit_breakdown = {
+        'Target':  round(outcomes.count('Target')  / total * 100, 1),
+        'Stop':    round(outcomes.count('Stop')    / total * 100, 1),
+        'Timeout': round(outcomes.count('Timeout') / total * 100, 1),
+        'Trend':   round(outcomes.count('Trend')   / total * 100, 1),
+    }
 
     best_trade  = max(trades, key=lambda t: t['pnl_pct'])
     worst_trade = min(trades, key=lambda t: t['pnl_pct'])
@@ -430,6 +499,8 @@ def run_backtest(
         'max_drawdown_pct': round(max_dd, 2),
         'sharpe_ratio':     round(sharpe, 2),
         'total_trades':     len(trades),
+        'avg_hold_days':    avg_hold_days,
+        'exit_breakdown':   exit_breakdown,
         'best_trade':       best_trade,
         'worst_trade':      worst_trade,
         'final_capital':    round(capital, 2),
@@ -438,14 +509,21 @@ def run_backtest(
     }
 
 
-def run_multi_backtest(tickers: list, initial_capital: float = 1000) -> pd.DataFrame:
+def run_multi_backtest(
+    tickers: list,
+    initial_capital: float = 1000,
+    quality_threshold: int = 60,
+    hold_days: int = 10,
+) -> pd.DataFrame:
     """
     Run backtest on multiple tickers; return comparison DataFrame sorted by
     Total Return % descending.
     """
     rows = []
     for t in tickers:
-        r = run_backtest(t, initial_capital)
+        r = run_backtest(t, initial_capital,
+                         quality_threshold=quality_threshold,
+                         hold_days=hold_days)
         rows.append({
             'Ticker':          r['ticker'],
             'Total Return %':  r['total_return_pct'],
@@ -453,6 +531,7 @@ def run_multi_backtest(tickers: list, initial_capital: float = 1000) -> pd.DataF
             'Profit Factor':   r['profit_factor'],
             'Max Drawdown %':  r['max_drawdown_pct'],
             'Sharpe Ratio':    r['sharpe_ratio'],
+            'Avg Hold Days':   r['avg_hold_days'],
             'Total Trades':    r['total_trades'],
             'Final Capital':   r['final_capital'],
         })
@@ -467,7 +546,7 @@ def run_multi_backtest(tickers: list, initial_capital: float = 1000) -> pd.DataF
     return df_out
 
 
-# ── Private helpers ──────────────────────────────────────────────────────────────
+# ── Private helpers ───────────────────────────────────────────────────────────
 
 def _empty_result(ticker: str, error, initial_capital: float) -> dict:
     return {
@@ -483,6 +562,8 @@ def _empty_result(ticker: str, error, initial_capital: float) -> dict:
         'max_drawdown_pct': 0.0,
         'sharpe_ratio':     0.0,
         'total_trades':     0,
+        'avg_hold_days':    0.0,
+        'exit_breakdown':   {'Target': 0.0, 'Stop': 0.0, 'Timeout': 0.0, 'Trend': 0.0},
         'best_trade':       None,
         'worst_trade':      None,
         'final_capital':    float(initial_capital),

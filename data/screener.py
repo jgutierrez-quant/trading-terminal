@@ -170,8 +170,11 @@ def run_market_scan(
             tech = get_technicals(ticker)
             if tech.get("error"):
                 continue
+            # check_earnings/check_sector disabled for screener performance
             anomaly = compute_anomaly(ticker, tech, mock_sent)
             if not anomaly.get("is_watch"):
+                continue
+            if anomaly.get("quality_score", 0) < 60:
                 continue
             pi = price_map.get(ticker, {})
             row = dict(anomaly)
@@ -181,7 +184,8 @@ def run_market_scan(
         except Exception as exc:
             logger.warning("Scan failed for %s: %s", ticker, exc)
 
-    results.sort(key=lambda r: r["score"], reverse=True)
+    # Sort by quality_score descending (Stage 9: was sorted by raw score)
+    results.sort(key=lambda r: r.get("quality_score", 0), reverse=True)
     return results
 
 
