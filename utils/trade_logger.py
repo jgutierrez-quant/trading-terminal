@@ -202,6 +202,33 @@ def close_trade(
         logger.error("close_trade %d failed: %s", trade_id, exc)
 
 
+def get_all_trades(limit: int = 100) -> list:
+    """
+    Fetch all trades from the database, most recent first.
+
+    Returns:
+        List of dicts: {id, ticker, entry_date, entry_price, exit_date, exit_price,
+                        quantity, side, pnl, pnl_percent, strategy_notes, outcome}
+    """
+    try:
+        with _conn() as con:
+            rows = con.execute(
+                "SELECT id, ticker, entry_date, entry_price, exit_date, exit_price, "
+                "quantity, side, pnl, pnl_percent, strategy_notes, outcome "
+                "FROM trades ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [
+            {"id": r[0], "ticker": r[1], "entry_date": r[2], "entry_price": r[3],
+             "exit_date": r[4], "exit_price": r[5], "quantity": r[6], "side": r[7],
+             "pnl": r[8], "pnl_percent": r[9], "strategy_notes": r[10], "outcome": r[11]}
+            for r in rows
+        ]
+    except Exception as exc:
+        logger.error("get_all_trades failed: %s", exc)
+        return []
+
+
 def get_performance_summary() -> dict:
     """
     Compute aggregate performance stats from the trades table.
@@ -237,7 +264,7 @@ def get_performance_summary() -> dict:
         avg_pnl    = round(total_pnl / len(closed_pnl), 2) if closed_pnl else None
         win_rate   = round(wins / closed * 100, 1) if closed else None
         best       = round(max(closed_pnl), 2) if closed_pnl else None
-        worst      = round(min(closed_pnl), 2) if closed_pnl else None
+        worst      = round(min(closed_pnl), 2) if len(closed_pnl) >= 2 else None
 
         return {
             "total_trades":  total,

@@ -174,7 +174,7 @@ def run_market_scan(
             anomaly = compute_anomaly(ticker, tech, mock_sent)
             if not anomaly.get("is_watch"):
                 continue
-            if anomaly.get("quality_score", 0) < 60:
+            if anomaly.get("quality_score", 0) < 50:
                 continue
             pi = price_map.get(ticker, {})
             row = dict(anomaly)
@@ -184,8 +184,23 @@ def run_market_scan(
         except Exception as exc:
             logger.warning("Scan failed for %s: %s", ticker, exc)
 
-    # Sort by quality_score descending (Stage 9: was sorted by raw score)
-    results.sort(key=lambda r: r.get("quality_score", 0), reverse=True)
+    # Stage 10: augment with fundamentals and apply composite ranking
+    from data.fundamentals import get_fundamentals, score_fundamentals
+    for row in results:
+        try:
+            fund   = get_fundamentals(row["ticker"])
+            scored = score_fundamentals(fund)
+            row["fundamental_score"] = scored["fundamental_score"]
+        except Exception:
+            row["fundamental_score"] = 0
+
+    def _composite(r):
+        anomaly_norm = min((r.get("score") or 0) / 6.0, 1.0) * 40
+        fund_norm    = ((r.get("fundamental_score") or 0) + 100) / 200 * 35
+        qual_norm    = (r.get("quality_score") or 0) / 100 * 25
+        return anomaly_norm + fund_norm + qual_norm
+
+    results.sort(key=_composite, reverse=True)
     return results
 
 

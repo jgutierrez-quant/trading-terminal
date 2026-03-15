@@ -20,6 +20,7 @@ in the calling code.
 
 import os
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 import requests
@@ -33,7 +34,7 @@ _FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
 _FRED_SERIES = [
     ("FEDFUNDS", "Fed Funds",    "%"),
     ("GS10",     "10Y Yield",   "%"),
-    ("CPIAUCSL", "CPI",         ""),
+    ("CPIAUCSL", "CPI",         "%"),
     ("UNRATE",   "Unemployment", "%"),
 ]
 
@@ -43,13 +44,17 @@ def get_macro_data() -> list[dict]:
     Fetch all 5 macro indicators. Each source failure returns a degraded
     entry (value=None, display_value='N/A') — never raises.
     """
-    results = []
     api_key = os.getenv("FRED_API_KEY", "")
 
-    for series_id, name, unit in _FRED_SERIES:
-        results.append(_fetch_fred(series_id, name, unit, api_key))
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        fred_futures = [
+            pool.submit(_fetch_fred, sid, name, unit, api_key)
+            for sid, name, unit in _FRED_SERIES
+        ]
+        sp_future = pool.submit(_fetch_sp500)
 
-    results.append(_fetch_sp500())
+    results = [f.result() for f in fred_futures]
+    results.append(sp_future.result())
     return results
 
 
@@ -62,13 +67,16 @@ def _fetch_fred(series_id: str, name: str, unit: str, api_key: str) -> dict:
         return base
 
     try:
-        cutoff = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+        # CPI needs 13 months of data to compute YoY% change
+        obs_limit = 13 if series_id == "CPIAUCSL" else 2
+        cutoff_days = 450 if series_id == "CPIAUCSL" else 90
+        cutoff = (datetime.now() - timedelta(days=cutoff_days)).strftime("%Y-%m-%d")
         resp = requests.get(_FRED_BASE, params={
             "series_id":         series_id,
             "api_key":           api_key,
             "file_type":         "json",
             "sort_order":        "desc",
-            "limit":             2,
+            "limit":             obs_limit,
             "observation_start": cutoff,
         }, timeout=10)
         resp.raise_for_status()
@@ -82,7 +90,22 @@ def _fetch_fred(series_id: str, name: str, unit: str, api_key: str) -> dict:
         change = None
         change_display = None
 
-        if len(obs) >= 2:
+        # CPI: convert raw index to YoY% inflation rate
+        if series_id == "CPIAUCSL" and len(obs) >= 13:
+            year_ago = float(obs[12]["value"])
+            yoy_pct = round(((latest - year_ago) / year_ago) * 100, 2)
+            # month-over-month delta for the change display
+            if len(obs) >= 2:
+                prev_index = float(obs[1]["value"])
+                prev_year_ago = float(obs[12]["value"])  # approximate
+                if len(obs) >= 13:
+                    # compute previous month's YoY for a proper delta
+                    prev_yoy = round(((prev_index - year_ago) / year_ago) * 100, 2)
+                    change = round(yoy_pct - prev_yoy, 4)
+                    sign = "+" if change >= 0 else ""
+                    change_display = sign + str(round(change, 3)) + unit
+            latest = yoy_pct
+        elif len(obs) >= 2:
             prev = float(obs[1]["value"])
             change = round(latest - prev, 4)
             sign = "+" if change >= 0 else ""

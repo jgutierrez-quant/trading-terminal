@@ -5,6 +5,8 @@ No API key required — yfinance scrapes Yahoo Finance.
 """
 
 import logging
+import math as _math
+
 import yfinance as yf
 
 logger = logging.getLogger(__name__)
@@ -99,7 +101,6 @@ def get_earnings_dates(ticker: str) -> list[dict]:
 def _safe_float(val) -> float | None:
     try:
         f = float(val)
-        import math
-        return None if math.isnan(f) else round(f, 4)
+        return None if _math.isnan(f) else round(f, 4)
     except (TypeError, ValueError):
         return None

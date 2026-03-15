@@ -12,7 +12,8 @@ Public API:
     compute_anomaly(ticker, tech_dict, sentiment_dict,
                     check_earnings=False, check_sector=False,
                     check_fundamentals=False,
-                    check_factor_model=False) -> dict
+                    check_factor_model=False,
+                    check_catalysts=False) -> dict
 
 Returns:
     {
@@ -33,6 +34,10 @@ Returns:
         "factor_model":        dict|None,  # full compute_factor_model() output
         "composite_factor_score": float|None,  # 0-100 weighted composite
         "pead_candidate":      bool|None,  # True if active PEAD opportunity
+        # Stage 12 — catalyst detector fields (None when check_catalysts=False)
+        "catalyst_result":     dict|None,  # full detect_catalysts() output
+        "catalyst_boost":      int,        # net boost -100..+100
+        "catalyst_why":        list[str],  # plain English reasons
     }
 """
 
@@ -45,7 +50,7 @@ from data.fundamentals import get_fundamentals, score_fundamentals
 
 logger = logging.getLogger(__name__)
 
-WATCH_THRESHOLD = 3   # 3 aligned signals required (Stage 9c: direction logic preserved)
+from utils.config import WATCH_THRESHOLD  # 3 aligned signals (Stage 9c)
 
 # ── Sector ETF mapping (mirrors sector_monitor.py SECTOR_ETFS) ─────────────────
 _SECTOR_ETF = {
@@ -66,12 +71,12 @@ _SECTOR_ETF = {
 _BULLISH = {
     'Oversold RSI', 'Bullish MACD Cross', 'BB Oversold',
     'Above VWAP', 'Price Above MA20+MA50', 'Bullish News Sentiment',
-    'Bullish Fundamentals',
+    'Bullish Fundamentals', 'Bullish Catalyst',
 }
 _BEARISH = {
     'Overbought RSI', 'Bearish MACD Cross', 'BB Overbought',
     'Below VWAP', 'Price Below MA20+MA50', 'Bearish News Sentiment',
-    'Bearish Fundamentals',
+    'Bearish Fundamentals', 'Bearish Catalyst',
 }
 
 
@@ -85,6 +90,7 @@ def compute_anomaly(
     check_sector: bool = False,
     check_fundamentals: bool = False,
     check_factor_model: bool = False,
+    check_catalysts: bool = False,
 ) -> dict:
     """
     Evaluate technical and sentiment signals for `ticker`.
@@ -233,6 +239,24 @@ def compute_anomaly(
         except Exception as exc:
             logger.debug("Factor model check failed for %s: %s", ticker, exc)
 
+    # ── Catalyst detection (optional — Stage 12) ───────────────────────────────
+    catalyst_result = None
+    catalyst_boost  = 0
+    catalyst_why    = []
+    if check_catalysts:
+        try:
+            from data.catalyst_detector import detect_catalysts
+            catalyst_result = detect_catalysts(ticker)
+            catalyst_boost  = catalyst_result.get("boost", 0)
+            catalyst_why    = catalyst_result.get("why", [])
+            cat_dir = catalyst_result.get("direction", "Neutral")
+            if cat_dir == "Bullish":
+                signals.append("Bullish Catalyst")
+            elif cat_dir == "Bearish":
+                signals.append("Bearish Catalyst")
+        except Exception as exc:
+            logger.debug("Catalyst check failed for %s: %s", ticker, exc)
+
     # ── Sector momentum (optional — adds to score) ────────────────────────────
     sector_ok = False
     if check_sector:
@@ -282,6 +306,10 @@ def compute_anomaly(
         "factor_model":           factor_model_result,
         "composite_factor_score": composite_factor_score,
         "pead_candidate":         pead_candidate,
+        # Stage 12 — catalyst fields
+        "catalyst_result":        catalyst_result,
+        "catalyst_boost":         catalyst_boost,
+        "catalyst_why":           catalyst_why,
     }
 
 

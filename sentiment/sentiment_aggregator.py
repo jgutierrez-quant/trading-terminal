@@ -13,6 +13,7 @@ the sources that did return data, so the score is always meaningful.
 """
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 from sentiment.yahoo_news_client   import get_news_sentiment   as yahoo_sentiment
 from sentiment.finviz_client        import get_news_sentiment   as finviz_sentiment
@@ -58,10 +59,15 @@ def get_sentiment(ticker: str) -> dict:
     ticker = ticker.upper().strip()
     logger.info("Fetching sentiment for %s", ticker)
 
-    # --- Call all sources independently ---
-    yahoo  = _safe(yahoo_sentiment,  ticker, label="yahoo")
-    finviz = _safe(finviz_sentiment, ticker, label="finviz")
-    trends = _safe(get_trend,        ticker, label="google_trends")
+    # --- Call all sources in parallel (3 independent HTTP calls) ---
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        f_yahoo  = pool.submit(_safe, yahoo_sentiment,  ticker, label="yahoo")
+        f_finviz = pool.submit(_safe, finviz_sentiment, ticker, label="finviz")
+        f_trends = pool.submit(_safe, get_trend,        ticker, label="google_trends")
+
+    yahoo  = f_yahoo.result()
+    finviz = f_finviz.result()
+    trends = f_trends.result()
 
     yahoo_score  = yahoo.get("score")
     finviz_score = finviz.get("score")

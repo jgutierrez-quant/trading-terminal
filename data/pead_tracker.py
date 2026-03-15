@@ -15,6 +15,7 @@ Each candidate dict:
 """
 
 import logging
+import math
 from datetime import date, datetime, timedelta
 
 import numpy as np
@@ -353,5 +354,3 @@ def _sf(val):
         return None
 
 
-# Lazy import to avoid circular at module level
-import math

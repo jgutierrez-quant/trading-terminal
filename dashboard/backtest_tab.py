@@ -26,16 +26,8 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-# ── Color constants (mirrors app.py) ─────────────────────────────────────────
-GREEN   = "#00ff88"
-RED     = "#ff4444"
-YELLOW  = "#ffd700"
-BLUE    = "#4488ff"
-NEUTRAL = "#888888"
-BG      = "#0e1117"
-BG2     = "#1a1d24"
-
-WATCH_THRESHOLD = 3   # must match anomaly_detector.py (Stage 9c)
+# ── Color constants + thresholds ─────────────────────────────────────────────
+from utils.config import GREEN, RED, YELLOW, BLUE, NEUTRAL, BG, BG2, WATCH_THRESHOLD
 
 
 # ── Public entry point ────────────────────────────────────────────────────────

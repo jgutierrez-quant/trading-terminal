@@ -174,7 +174,7 @@ def test_run_backtest():
             risk_percent=2.0,
             risk_reward=2.0,
             hold_days=10,
-            quality_threshold=60,
+            quality_threshold=50,
             check_earnings=True,
         )
         _print_result(result)
@@ -209,7 +209,7 @@ def test_run_multi_backtest():
     df = run_multi_backtest(
         ['AAPL', 'NVDA', 'TSLA'],
         initial_capital=1000,
-        quality_threshold=60,
+        quality_threshold=50,
         hold_days=10,
     )
 

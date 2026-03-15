@@ -10,18 +10,7 @@ bullish signal (retail attention). Falling = mild bearish proxy.
 
 import logging
 
-import urllib3
-import urllib3.util.retry as _retry_mod
-
-# pytrends 4.9.2 passes `method_whitelist` to urllib3.util.retry.Retry,
-# but urllib3 v2 renamed that arg to `allowed_methods`. Patch for compat.
-_orig_retry_init = _retry_mod.Retry.__init__
-def _patched_retry_init(self, *args, **kwargs):
-    if "method_whitelist" in kwargs:
-        kwargs["allowed_methods"] = kwargs.pop("method_whitelist")
-    _orig_retry_init(self, *args, **kwargs)
-_retry_mod.Retry.__init__ = _patched_retry_init
-
+# urllib3 v2 compat patch applied in sentiment/__init__.py
 from pytrends.request import TrendReq
 
 logger = logging.getLogger(__name__)

@@ -1,17 +1,18 @@
 """
 Quantitative Factor Model — Stage 11.
 
-6-factor scoring engine based on academically validated anomalies.
+7-factor scoring engine based on academically validated anomalies.
 Each factor is independently scored and normalized to a percentile (0-100)
 against a peer universe. Composite score drives Long/Short/Neutral signals.
 
 Factors and weights:
-    1. Price Momentum      (20%)  — Jegadeesh & Titman 12-1 month
-    2. Earnings Momentum   (20%)  — Ball & Brown SUE + PEAD
-    3. Value               (15%)  — EV/EBITDA, P/E, P/B, FCF yield
-    4. Quality             (20%)  — ROE, margins, leverage, stability
-    5. Short Interest      (10%)  — Short float %, days-to-cover, squeeze
-    6. Institutional Flow  (15%)  — Ownership %, insider ratio, upgrades
+    1. Price Momentum      (18%)  — Jegadeesh & Titman 12-1 month
+    2. Earnings Momentum   (18%)  — Ball & Brown SUE + PEAD
+    3. Value               (14%)  — EV/EBITDA, P/E, P/B, FCF yield
+    4. Quality             (18%)  — ROE, margins, leverage, stability
+    5. Short Interest       (9%)  — Short float %, days-to-cover, squeeze
+    6. Institutional Flow  (13%)  — Ownership %, insider ratio, upgrades
+    7. DCF Intrinsic Value (10%)  — 5-year DCF margin of safety
 
 Composite:
     Weighted average of available factor percentiles.
@@ -34,24 +35,27 @@ import json
 import logging
 import math
 import os
+import time
 from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from data.dcf import compute_dcf
 from data.fundamentals import get_fundamentals
 
 logger = logging.getLogger(__name__)
 
 # ── Weights ───────────────────────────────────────────────────────────────────
 FACTOR_WEIGHTS = {
-    "momentum":          0.20,
-    "earnings_momentum": 0.20,
-    "value":             0.15,
-    "quality":           0.20,
-    "short_interest":    0.10,
-    "institutional":     0.15,
+    "momentum":          0.18,
+    "earnings_momentum": 0.18,
+    "value":             0.14,
+    "quality":           0.18,
+    "short_interest":    0.09,
+    "institutional":     0.13,
+    "dcf":               0.10,
 }
 
 # ── Calibrated distribution priors (S&P 500 empirical) ───────────────────────
@@ -72,6 +76,7 @@ PRIORS = {
     "short_pct_float": {"mean":  0.04,  "std": 0.04},
     "short_ratio":     {"mean":  3.5,   "std": 2.5},
     "inst_ownership":  {"mean":  0.70,  "std": 0.15},
+    "dcf_margin_of_safety": {"mean": 0.0, "std": 0.25},
 }
 
 # ── Universe sample for z-score normalization ─────────────────────────────────
@@ -117,7 +122,7 @@ def compute_factor_model(ticker: str, fund_dict: dict = None) -> dict:
         except Exception:
             fund_dict = {}
 
-    # Compute all 6 factors independently
+    # Compute all 7 factors independently
     factors = {
         "momentum":          _factor_momentum(ticker),
         "earnings_momentum": _factor_earnings_momentum(ticker),
@@ -125,6 +130,7 @@ def compute_factor_model(ticker: str, fund_dict: dict = None) -> dict:
         "quality":           _factor_quality(fund_dict),
         "short_interest":    _factor_short_interest(fund_dict),
         "institutional":     _factor_institutional(fund_dict),
+        "dcf":               _factor_dcf(ticker, fund_dict),
     }
 
     # Build composite from available factors only
@@ -226,7 +232,6 @@ def _compute_universe_stats() -> dict:
     Compute live price momentum stats from universe sample.
     Uses yfinance bulk download (single API call for all tickers).
     """
-    import time as _time
     try:
         hist = yf.download(
             _UNIVERSE_SAMPLE, period="14mo", interval="1mo",
@@ -703,6 +708,54 @@ def _factor_institutional(fund_dict: dict) -> dict:
         return _unavailable(str(exc))
 
 
+# ── Factor 7: DCF Intrinsic Value ────────────────────────────────────────────
+
+def _factor_dcf(ticker: str, fund_dict: dict) -> dict:
+    """
+    DCF-based valuation factor.
+
+    Positive margin of safety (undervalued) → Bullish percentile.
+    Negative margin of safety (overvalued)  → Bearish percentile.
+    """
+    try:
+        dcf_result = compute_dcf(ticker, fund_dict)
+
+        if dcf_result.get("error") or dcf_result.get("margin_of_safety") is None:
+            return _unavailable(dcf_result.get("error") or "DCF computation unavailable")
+
+        mos = dcf_result["margin_of_safety"]
+
+        # Convert margin_of_safety to z-score using prior distribution
+        prior = PRIORS["dcf_margin_of_safety"]
+        z = _to_z(mos, prior["mean"], prior["std"])
+        pct = _z_to_pct(z)
+
+        signal_str = dcf_result.get("signal", "Neutral")
+        if signal_str == "Undervalued":
+            signal = "Bullish"
+        elif signal_str == "Overvalued":
+            signal = "Bearish"
+        else:
+            signal = "Neutral"
+
+        return _factor_result(
+            raw=round(mos, 4),
+            z_score=round(z, 3),
+            percentile=round(pct, 1),
+            signal=signal,
+            details={
+                "intrinsic_value": dcf_result.get("intrinsic_value"),
+                "current_price": dcf_result.get("current_price"),
+                "margin_of_safety_pct": round(mos * 100, 1),
+                "dcf_signal": signal_str,
+                "scenarios": dcf_result.get("scenarios"),
+            },
+        )
+    except Exception as exc:
+        logger.debug("Factor 7 (DCF) failed for %s: %s", ticker, exc)
+        return _unavailable(str(exc))
+
+
 # ── Private helpers ───────────────────────────────────────────────────────────
 
 def _factor_result(raw, z_score, percentile, signal, details) -> dict:
@@ -785,5 +838,3 @@ def _sf(val):
         return None
 
 
-# Lazy import for time (avoid shadowing at module top)
-import time

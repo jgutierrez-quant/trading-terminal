@@ -203,6 +203,67 @@ def place_order(
         return {"error": str(exc)}
 
 
+def place_bracket_order(
+    ticker: str,
+    qty: int,
+    side: str,
+    limit_price: float,
+    stop_loss: float,
+    take_profit: float,
+) -> dict:
+    """
+    Submit a bracket (OTO/OCO) order to Alpaca.
+
+    A bracket order places all three legs at once:
+        1. Entry: limit order at limit_price
+        2. Take profit: limit sell at take_profit (auto-created when entry fills)
+        3. Stop loss: stop sell at stop_loss (auto-created when entry fills)
+
+    When entry fills, both exit orders go live. If one exit fills, the other cancels.
+
+    Returns:
+        {id, ticker, qty, side, order_type, status, submitted_at, legs, error}
+    """
+    try:
+        body = {
+            "symbol":        ticker.upper(),
+            "qty":           str(int(qty)),
+            "side":          side.lower(),
+            "type":          "limit",
+            "time_in_force": "gtc",
+            "limit_price":   str(round(limit_price, 2)),
+            "order_class":   "bracket",
+            "take_profit":   {"limit_price": str(round(take_profit, 2))},
+            "stop_loss":     {"stop_price":  str(round(stop_loss, 2))},
+        }
+        raw = _post(f"{_TRADING_URL}/v2/orders", body)
+        legs = raw.get("legs") or []
+        leg_info = []
+        for leg in legs:
+            leg_info.append({
+                "id":     leg.get("id", "")[:8],
+                "type":   leg.get("type", ""),
+                "side":   leg.get("side", ""),
+                "status": leg.get("status", ""),
+                "limit":  leg.get("limit_price"),
+                "stop":   leg.get("stop_price"),
+            })
+        return {
+            "id":           raw.get("id", ""),
+            "ticker":       raw.get("symbol", ""),
+            "qty":          float(raw.get("qty") or 0),
+            "side":         raw.get("side", ""),
+            "order_type":   "bracket",
+            "status":       raw.get("status", ""),
+            "submitted_at": (raw.get("submitted_at") or "")[:19],
+            "legs":         leg_info,
+            "error":        None,
+        }
+    except Exception as exc:
+        logger.error("place_bracket_order %s %s %s failed: %s", side, qty, ticker, exc)
+        return {"error": str(exc)}
+
+
 def close_position(ticker: str) -> dict:
     """
     Liquidate an entire open position at market price.
@@ -258,4 +319,40 @@ def get_real_time_quote(ticker: str) -> dict:
         }
     except Exception as exc:
         logger.error("get_real_time_quote %s failed: %s", ticker, exc)
+        return {"ticker": ticker.upper(), "error": str(exc)}
+
+
+def get_snapshot(ticker: str) -> dict:
+    """
+    Fetch Alpaca stock snapshot (includes minute bar, daily bar, prev daily bar).
+    Useful for pre-market volume detection and gap analysis.
+
+    Returns:
+        {ticker, last_price, day_volume, prev_close, prev_volume,
+         premarket_volume, avg_volume, error}
+    """
+    try:
+        url = f"{_DATA_URL}/v2/stocks/{ticker.upper()}/snapshot"
+        raw = _get(url, params={"feed": "iex"})
+
+        day_bar  = raw.get("dailyBar", {}) or {}
+        prev_bar = raw.get("prevDailyBar", {}) or {}
+        minute   = raw.get("minuteBar", {}) or {}
+        latest   = raw.get("latestTrade", {}) or {}
+
+        day_vol  = int(day_bar.get("v", 0) or 0)
+        prev_vol = int(prev_bar.get("v", 0) or 0)
+
+        return {
+            "ticker":           ticker.upper(),
+            "last_price":       float(latest.get("p", 0) or 0),
+            "day_volume":       day_vol,
+            "prev_close":       float(prev_bar.get("c", 0) or 0),
+            "prev_volume":      prev_vol,
+            "premarket_volume": day_vol,       # during pre-market, day_volume IS pre-market volume
+            "avg_volume":       prev_vol,      # use previous day as proxy
+            "error":            None,
+        }
+    except Exception as exc:
+        logger.error("get_snapshot %s failed: %s", ticker, exc)
         return {"ticker": ticker.upper(), "error": str(exc)}

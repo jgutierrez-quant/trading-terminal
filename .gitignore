@@ -23,3 +23,18 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Runtime data / caches
+.cache/
+*.db
+backtest_results/
+
+# User-specific data files
+watchlist.json
+consensus_cache.json
+pick_history.csv
+daily_all_props.csv
+entries.csv
+picks.csv
+clv_log.csv
+top_props_log.csv

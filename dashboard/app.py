@@ -24,8 +24,8 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(_ROOT, ".env"))
 
-# Apply urllib3 v2 compat patch for pytrends before importing aggregator
-import sentiment.google_trends_client  # noqa: F401
+# Import sentiment package (applies urllib3 v2 compat patch for pytrends)
+import sentiment  # noqa: F401
 
 from data.market_data               import get_ticker_data
 from data.technicals                import get_technicals
@@ -35,24 +35,26 @@ from sentiment.yahoo_news_client    import get_news_sentiment as _yahoo_fast
 from utils.watchlist                import load_watchlist, add_ticker, remove_ticker
 from utils.macro_data               import get_macro_data
 from data.alpaca_client             import (get_account, get_positions, get_orders,
-                                            place_order, close_position, cancel_order)
+                                            place_order, place_bracket_order,
+                                            close_position, cancel_order)
 from utils.risk_manager             import (calculate_position_size, calculate_stop_loss,
                                             calculate_take_profit, validate_trade,
                                             get_market_hours)
-from utils.trade_logger             import log_signal, log_trade, get_performance_summary
+from utils.trade_logger             import log_signal, log_trade, get_performance_summary, get_all_trades, close_trade
+from utils.alerts                   import (add_price_alert, remove_price_alert, get_price_alerts,
+                                            check_price_alerts, log_alert, get_alert_log, clear_alert_log)
+from utils.market_regime            import get_market_regime
 from dashboard.backtest_tab         import render_backtest_tab
+from dashboard.performance_tab     import render_performance_tab
 from data.fundamentals              import get_fundamentals, score_fundamentals, get_short_squeeze_score
+from data.catalyst_detector         import detect_catalysts, scan_catalysts
+from data.whale_detector            import detect_whales, scan_whales
+from data.trade_coach               import analyze_setup
 
 logging.basicConfig(level=logging.WARNING)
 
 # ── Colors ────────────────────────────────────────────────────────────────────
-GREEN   = "#00ff88"
-RED     = "#ff4444"
-YELLOW  = "#ffd700"
-BLUE    = "#4488ff"
-NEUTRAL = "#888888"
-BG      = "#0e1117"
-BG2     = "#1a1d24"
+from utils.config import GREEN, RED, YELLOW, BLUE, NEUTRAL, BG, BG2
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -115,6 +117,10 @@ if "pending_order" not in st.session_state:
     st.session_state.pending_order = None     # dict when an order is awaiting confirmation
 if "logged_signals_today" not in st.session_state:
     st.session_state.logged_signals_today = set()  # "TICKER_YYYY-MM-DD" keys
+if "logged_alerts_today" not in st.session_state:
+    st.session_state.logged_alerts_today = set()   # dedup alert logging per session
+if "_scan_score_map" not in st.session_state:
+    st.session_state._scan_score_map = {}          # {ticker: quality_score} from last scan
 
 
 # ── Cached fetchers — Market View ─────────────────────────────────────────────
@@ -142,7 +148,8 @@ def cached_anomaly(ticker: str) -> dict:
     sent = cached_sentiment(ticker)
     return compute_anomaly(ticker, tech, sent, check_earnings=True,
                            check_sector=True, check_fundamentals=True,
-                           check_factor_model=True)
+                           check_factor_model=True,
+                           check_catalysts=True)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -159,6 +166,21 @@ def cached_fundamentals(ticker: str) -> dict:
 def cached_factor_model(ticker: str) -> dict:
     from data.factor_model import compute_factor_model
     return compute_factor_model(ticker)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_catalysts(ticker: str) -> dict:
+    return detect_catalysts(ticker)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_whales(ticker: str) -> dict:
+    return detect_whales(ticker)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_trade_coach(ticker: str, account_value: float = 100_000, risk_pct: float = 1.0) -> dict:
+    return analyze_setup(ticker, account_value=account_value, risk_pct=risk_pct)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -290,35 +312,54 @@ def cached_market_scan() -> list:
         except Exception:
             continue
 
-    # Stage 10: augment top 15 with fundamentals, then apply composite ranking
-    for row in results[:15]:
+    # Stage 10-12: augment top 15 with fundamentals, top 10 with factor model + catalysts
+    # Parallelized — all functions are stateless and thread-safe
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from data.factor_model import compute_factor_model
+
+    def _augment_row(row, idx):
+        ticker = row["ticker"]
         try:
-            fund  = cached_fundamentals(row["ticker"])
+            fund = get_fundamentals(ticker)
             scored = score_fundamentals(fund)
             row["fundamental_score"]  = scored["fundamental_score"]
             row["fundamental_signal"] = scored["fundamental_signal"]
         except Exception:
             row["fundamental_score"]  = 0
             row["fundamental_signal"] = "Neutral"
+        if idx < 10:
+            try:
+                fm = compute_factor_model(ticker)
+                row["composite_factor_score"] = fm.get("composite_score", 50.0)
+                row["factor_signal"]          = fm.get("composite_signal", "Neutral")
+                row["pead_candidate"]         = fm.get("pead_candidate", False)
+            except Exception:
+                row["composite_factor_score"] = 50.0
+                row["factor_signal"]          = "Neutral"
+                row["pead_candidate"]         = False
+            try:
+                cat = detect_catalysts(ticker)
+                row["catalyst_boost"]     = cat.get("boost", 0)
+                row["catalyst_direction"] = cat.get("direction", "Neutral")
+                row["catalyst_why"]       = cat.get("why", [])
+            except Exception:
+                row["catalyst_boost"]     = 0
+                row["catalyst_direction"] = "Neutral"
+                row["catalyst_why"]       = []
+        return row
 
-    # Stage 11: augment top 10 with factor model composite score
-    for row in results[:10]:
-        try:
-            fm = cached_factor_model(row["ticker"])
-            row["composite_factor_score"] = fm.get("composite_score", 50.0)
-            row["factor_signal"]          = fm.get("composite_signal", "Neutral")
-            row["pead_candidate"]         = fm.get("pead_candidate", False)
-        except Exception:
-            row["composite_factor_score"] = 50.0
-            row["factor_signal"]          = "Neutral"
-            row["pead_candidate"]         = False
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_augment_row, row, i) for i, row in enumerate(results[:15])]
+        for f in as_completed(futures):
+            f.result()  # rows mutated in-place; propagate exceptions if any
 
     def _composite(r):
-        anomaly_norm = min((r.get("score") or 0) / 6.0, 1.0) * 30
-        fund_norm    = ((r.get("fundamental_score") or 0) + 100) / 200 * 25
-        qual_norm    = (r.get("quality_score") or 0) / 100 * 20
-        factor_norm  = (r.get("composite_factor_score") or 50.0) / 100 * 25
-        return anomaly_norm + fund_norm + qual_norm + factor_norm
+        anomaly_norm  = min((r.get("score") or 0) / 6.0, 1.0) * 25
+        fund_norm     = ((r.get("fundamental_score") or 0) + 100) / 200 * 22
+        qual_norm     = (r.get("quality_score") or 0) / 100 * 18
+        factor_norm   = (r.get("composite_factor_score") or 50.0) / 100 * 22
+        catalyst_norm = ((r.get("catalyst_boost") or 0) + 100) / 200 * 13
+        return anomaly_norm + fund_norm + qual_norm + factor_norm + catalyst_norm
 
     results.sort(key=_composite, reverse=True)
     return results
@@ -342,6 +383,12 @@ def cached_positions() -> list:
 def cached_orders(status: str = "all", limit: int = 20) -> list:
     """Recent Alpaca orders. TTL=60s."""
     return get_orders(status=status, limit=limit)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_market_regime() -> dict:
+    """Market regime (SPY/QQQ/VIX). TTL=15min."""
+    return get_market_regime()
 
 
 # ── Formatting helpers ────────────────────────────────────────────────────────
@@ -445,8 +492,9 @@ def _signal_badge(label: str, value_str: str, color: str) -> str:
         f'</div>'
     )
 
-def _movers_table_html(rows: list, accent: str) -> str:
+def _movers_table_html(rows: list, accent: str, score_map: dict = None) -> str:
     """Pure-HTML table for gainers/losers — no interactive elements needed."""
+    score_map = score_map or {}
     html = (
         '<table style="width:100%;border-collapse:collapse;'
         'font-size:0.8rem;font-family:monospace">'
@@ -455,6 +503,7 @@ def _movers_table_html(rows: list, accent: str) -> str:
         '<th style="text-align:right;padding:4px 8px">Price</th>'
         '<th style="text-align:right;padding:4px 8px">Chg%</th>'
         '<th style="text-align:right;padding:4px 8px">Vol</th>'
+        '<th style="text-align:right;padding:4px 8px">Score</th>'
         '</tr>'
     )
     for row in rows:
@@ -463,6 +512,13 @@ def _movers_table_html(rows: list, accent: str) -> str:
         chg_str   = f"{chg:+.2f}%" if chg is not None else "N/A"
         price_str = f'${row["price"]:.2f}' if row.get("price") else "N/A"
         vol_str   = _fmt_volume(row.get("volume"))
+        qs        = score_map.get(row["ticker"])
+        if qs is not None:
+            qs_color = GREEN if qs >= 70 else (YELLOW if qs >= 50 else NEUTRAL)
+            qs_str   = f'{qs:.0f}'
+        else:
+            qs_color = NEUTRAL
+            qs_str   = '—'
         html += (
             f'<tr style="border-bottom:1px solid #1e2128">'
             f'<td style="padding:4px 8px;color:{accent};font-weight:bold">'
@@ -470,6 +526,7 @@ def _movers_table_html(rows: list, accent: str) -> str:
             f'<td style="padding:4px 8px;text-align:right">{price_str}</td>'
             f'<td style="padding:4px 8px;text-align:right;color:{chg_c}">{chg_str}</td>'
             f'<td style="padding:4px 8px;text-align:right;color:{NEUTRAL}">{vol_str}</td>'
+            f'<td style="padding:4px 8px;text-align:right;color:{qs_color};font-weight:bold">{qs_str}</td>'
             f'</tr>'
         )
     html += '</table>'
@@ -723,7 +780,7 @@ def _build_gauge(score, label: str) -> go.Figure:
         ),
     ))
     fig.update_layout(paper_bgcolor=BG, font=dict(color="#fafafa"),
-                      height=250, margin=dict(l=20, r=20, t=50, b=0))
+                      height=250, margin=dict(l=40, r=40, t=50, b=10))
     return fig
 
 
@@ -742,6 +799,7 @@ def _build_factor_radar(factor_model_dict: dict) -> go.Figure:
         ("quality",           "Quality"),
         ("short_interest",    "Short Int."),
         ("institutional",     "Inst. Flow"),
+        ("dcf",               "DCF Value"),
     ]
     for key, display in factor_order:
         f = factors.get(key, {})
@@ -1056,8 +1114,7 @@ def _render_market_tab(selected: str):
     yahoo_str     = _fmt_float(yahoo_score, 3) if yahoo_score is not None else "N/A"
     finviz_str    = _fmt_float(finviz_score, 3) if finviz_score is not None else "N/A"
     trend_label   = (trend_dir or "N/A").capitalize()
-    trend_val_str = "" if trend_val_v is None else f" ({trend_val_v}/100)"
-    trend_display = trend_label + trend_val_str
+    trend_val_display = "N/A" if trend_val_v is None else str(trend_val_v)
     overall_str   = "N/A" if overall_score is None else _fmt_float(overall_score, 4)
 
     sent_left, sent_right = st.columns([3, 2])
@@ -1068,7 +1125,7 @@ def _render_market_tab(selected: str):
         with sc_row[1]:
             st.metric("Finviz", finviz_str)
         with sc_row[2]:
-            st.metric("G-Trends", trend_display)
+            st.metric("G-Trends", trend_val_display, delta=trend_label)
         st.markdown("<br>", unsafe_allow_html=True)
         lc = _label_color(overall_label)
         st.markdown(
@@ -1194,6 +1251,7 @@ def _render_market_tab(selected: str):
                 ("quality",           "Quality"),
                 ("short_interest",    "Short Interest"),
                 ("institutional",     "Institutional Flow"),
+                ("dcf",               "DCF Intrinsic Value"),
             ]
             tbl_rows = []
             for fkey, fname in factor_labels:
@@ -1225,6 +1283,65 @@ def _render_market_tab(selected: str):
                     f'</div>',
                     unsafe_allow_html=True,
                 )
+
+    # ── DCF VALUATION SUMMARY ────────────────────────────────────────────────
+    if fm_data and not fm_data.get("error"):
+        dcf_factor = fm_data.get("factors", {}).get("dcf", {})
+        dcf_details = dcf_factor.get("details", {})
+        dcf_iv = dcf_details.get("intrinsic_value")
+        dcf_price = dcf_details.get("current_price")
+        dcf_mos = dcf_details.get("margin_of_safety_pct")
+        dcf_sig = dcf_details.get("dcf_signal")
+        dcf_scenarios = dcf_details.get("scenarios") or {}
+
+        if dcf_iv is not None and dcf_price is not None:
+            dcf_color = GREEN if dcf_sig == "Undervalued" else (RED if dcf_sig == "Overvalued" else NEUTRAL)
+            mos_sign = "+" if (dcf_mos or 0) >= 0 else ""
+
+            scenario_str = ""
+            if dcf_scenarios:
+                bear_v = dcf_scenarios.get("bear", {}).get("intrinsic", "?")
+                bull_v = dcf_scenarios.get("bull", {}).get("intrinsic", "?")
+                scenario_str = f"  |  Bear: ${bear_v}  —  Bull: ${bull_v}"
+
+            st.markdown(
+                f'<div style="background:{BG2};border:1px solid {dcf_color};border-radius:6px;'
+                f'padding:7px 14px;margin:6px 0;display:flex;justify-content:space-between;align-items:center">'
+                f'<span style="font-size:1.0rem;font-weight:bold;color:{dcf_color}">'
+                f'DCF: ${dcf_iv:.2f} vs ${dcf_price:.2f} · {dcf_sig.upper()}'
+                f'</span>'
+                f'<span style="color:{NEUTRAL};font-size:0.78rem">'
+                f'Margin: {mos_sign}{dcf_mos:.1f}%{scenario_str}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    # ── CATALYST DETECTOR (Stage 12) ────────────────────────────────────────────
+    cat_data = an_data.get("catalyst_result")
+    cat_boost = an_data.get("catalyst_boost", 0)
+    cat_why   = an_data.get("catalyst_why", [])
+    if cat_data and cat_data.get("catalysts"):
+        cat_dir   = cat_data.get("direction", "Neutral")
+        cat_color = GREEN if cat_dir == "Bullish" else (RED if cat_dir == "Bearish" else NEUTRAL)
+        sign_str  = f"+{cat_boost}" if cat_boost > 0 else str(cat_boost)
+        st.markdown(
+            f'<div style="background:{BG2};border:1px solid {cat_color};border-radius:6px;'
+            f'padding:7px 14px;margin:6px 0;display:flex;justify-content:space-between;align-items:center">'
+            f'<span style="font-size:1.0rem;font-weight:bold;color:{cat_color}">'
+            f'Catalysts: {cat_dir.upper()} ({sign_str})'
+            f'</span>'
+            f'<span style="color:{NEUTRAL};font-size:0.78rem">'
+            f'{len(cat_data["catalysts"])} active</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        for reason in cat_why:
+            bullet_c = GREEN if cat_boost > 0 else (RED if cat_boost < 0 else NEUTRAL)
+            st.markdown(
+                f'<div style="font-family:monospace;font-size:0.76rem;color:{bullet_c};'
+                f'padding:2px 0 2px 12px">* {reason}</div>',
+                unsafe_allow_html=True,
+            )
 
     # Tabbed charts
     tab_intra, tab_daily, tab_weekly = st.tabs(
@@ -1395,7 +1512,7 @@ def _render_screener_tab():
         )
         gainers = movers.get("gainers", [])
         if gainers:
-            st.markdown(_movers_table_html(gainers, GREEN), unsafe_allow_html=True)
+            st.markdown(_movers_table_html(gainers, GREEN, st.session_state.get("_scan_score_map", {})), unsafe_allow_html=True)
         else:
             st.caption("No data available.")
 
@@ -1407,7 +1524,7 @@ def _render_screener_tab():
         )
         losers = movers.get("losers", [])
         if losers:
-            st.markdown(_movers_table_html(losers, RED), unsafe_allow_html=True)
+            st.markdown(_movers_table_html(losers, RED, st.session_state.get("_scan_score_map", {})), unsafe_allow_html=True)
         else:
             st.caption("No data available.")
 
@@ -1433,11 +1550,33 @@ def _render_screener_tab():
         unsafe_allow_html=True,
     )
 
+    _flt_left, _flt_right = st.columns([2, 3])
+    with _flt_left:
+        scan_dir_filter = st.radio(
+            "Direction", ["Both", "Long Only", "Short Only"],
+            horizontal=True, label_visibility="collapsed",
+        )
+    with _flt_right:
+        scan_min_score = st.slider("Min Quality Score", 0, 100, 40, step=5)
+
     with st.spinner(
         "Running anomaly scan across 75 stocks "
         "(first run may take 1–2 min while technicals load)..."
     ):
         scan_results = cached_market_scan()
+
+    # Populate score map for movers table (available on next render)
+    st.session_state._scan_score_map = {
+        r["ticker"]: r.get("quality_score", 0) for r in scan_results
+    } if scan_results else {}
+
+    # Apply client-side filters
+    if scan_results:
+        if scan_dir_filter == "Long Only":
+            scan_results = [r for r in scan_results if r.get("direction") == "Long"]
+        elif scan_dir_filter == "Short Only":
+            scan_results = [r for r in scan_results if r.get("direction") == "Short"]
+        scan_results = [r for r in scan_results if r.get("quality_score", 0) >= scan_min_score]
 
     if not scan_results:
         st.caption(
@@ -1466,7 +1605,7 @@ def _render_screener_tab():
         # Column header strip (HTML — no buttons)
         st.markdown(
             '<div style="display:grid;'
-            'grid-template-columns:85px 75px 70px 55px 55px 60px 1fr 88px;'
+            'grid-template-columns:85px 75px 70px 55px 55px 60px 60px 1fr 88px;'
             'gap:4px;padding:5px 0 3px 0;'
             'font-size:0.7rem;color:#555;font-weight:bold;'
             'border-bottom:1px solid #2a2d35;font-family:monospace">'
@@ -1476,6 +1615,7 @@ def _render_screener_tab():
             '<span>SCORE</span>'
             '<span>DIR</span>'
             '<span>FACTOR</span>'
+            '<span>CAT</span>'
             '<span>SIGNALS / REASON</span>'
             '<span></span>'
             '</div>',
@@ -1493,6 +1633,8 @@ def _render_screener_tab():
             fm_score  = row.get("composite_factor_score")
             fm_sig    = row.get("factor_signal", "")
             pead      = row.get("pead_candidate", False)
+            cat_boost = row.get("catalyst_boost", 0)
+            cat_dir_r = row.get("catalyst_direction", "Neutral")
 
             dir_color = GREEN if direction == "Long" else (RED if direction == "Short" else NEUTRAL)
             accent    = dir_color
@@ -1502,13 +1644,15 @@ def _render_screener_tab():
             chg_str   = f"{chg:+.2f}%" if chg is not None else "N/A"
             fm_color  = (GREEN if fm_sig == "Long" else (RED if fm_sig == "Short" else NEUTRAL))
             fm_str    = f"{fm_score:.0f}" if fm_score is not None else "—"
+            cat_color = GREEN if cat_boost > 0 else (RED if cat_boost < 0 else NEUTRAL)
+            cat_str   = f"{cat_boost:+d}" if cat_boost != 0 else "—"
 
             ticker_display = ticker + (" 🔥" if row.get("is_watch") else "")
             if pead:
                 ticker_display += " 📈"
 
             # One st.columns() strip per row — required for st.button in last column
-            c1, c2, c3, c4, c4b, c4c, c5, c6 = st.columns([1.1, 1, 0.9, 0.7, 0.7, 0.75, 4.2, 1.1])
+            c1, c2, c3, c4, c4b, c4c, c4d, c5, c6 = st.columns([1.1, 1, 0.9, 0.7, 0.7, 0.75, 0.75, 3.5, 1.1])
 
             with c1:
                 st.markdown(
@@ -1543,12 +1687,52 @@ def _render_screener_tab():
                     f'<span style="color:{fm_color};font-size:0.82rem">{fm_str}</span>',
                     unsafe_allow_html=True,
                 )
-            with c5:
+            with c4d:
                 st.markdown(
-                    f'<span style="color:{NEUTRAL};font-size:0.76rem">'
-                    f'{reason[:80]}{"..." if len(reason) > 80 else ""}</span>',
+                    f'<span style="color:{cat_color};font-size:0.82rem;font-weight:bold">{cat_str}</span>',
                     unsafe_allow_html=True,
                 )
+            with c5:
+                with st.expander(f"{reason[:70]}{'...' if len(reason) > 70 else ''}"):
+                    # Individual signals
+                    for sig in row.get("signals", []):
+                        sig_color = GREEN if direction == "Long" else (RED if direction == "Short" else NEUTRAL)
+                        st.markdown(
+                            f'<span style="color:{sig_color};font-size:0.76rem">• {sig}</span>',
+                            unsafe_allow_html=True,
+                        )
+                    # Factor + Catalyst details
+                    detail_parts = []
+                    if fm_score is not None:
+                        detail_parts.append(f"Factor: {fm_score:.0f}/100")
+                    if cat_boost != 0:
+                        detail_parts.append(f"Catalyst: {cat_boost:+d}")
+                        cat_why = row.get("catalyst_why", [])
+                        if cat_why:
+                            detail_parts.append(" | ".join(cat_why[:2]))
+                    if detail_parts:
+                        st.markdown(
+                            f'<span style="color:{NEUTRAL};font-size:0.72rem">'
+                            f'{"  ·  ".join(detail_parts)}</span>',
+                            unsafe_allow_html=True,
+                        )
+                    # Coach verdict (derived from existing data)
+                    q = row.get("quality_score", 0)
+                    s = row.get("score", 0)
+                    if q >= 75 and s >= 5:
+                        verdict, grade = "Trade", "A"
+                    elif q >= 65 and s >= 4:
+                        verdict, grade = "Trade", "B"
+                    elif q >= 55 and s >= 3:
+                        verdict, grade = "Caution", "C"
+                    else:
+                        verdict, grade = "Skip", "D"
+                    v_color = GREEN if verdict == "Trade" else (YELLOW if verdict == "Caution" else NEUTRAL)
+                    st.markdown(
+                        f'<span style="color:{v_color};font-weight:bold;font-size:0.78rem">'
+                        f'{verdict} — Grade {grade} ({q})</span>',
+                        unsafe_allow_html=True,
+                    )
             with c6:
                 if in_wl:
                     st.markdown(
@@ -1580,6 +1764,1033 @@ def _render_screener_tab():
                     f'</div>',
                     unsafe_allow_html=True,
                 )
+
+        # Catalyst section — show tickers with active catalysts from the scan
+        cat_rows = [r for r in scan_results if r.get("catalyst_boost", 0) != 0]
+        if cat_rows:
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown(
+                f'<span style="color:{YELLOW};font-size:0.75rem;font-weight:bold">'
+                f'ACTIVE CATALYSTS DETECTED</span>',
+                unsafe_allow_html=True,
+            )
+            for cr in cat_rows:
+                cb = cr.get("catalyst_boost", 0)
+                cd = cr.get("catalyst_direction", "Neutral")
+                cc = GREEN if cb > 0 else (RED if cb < 0 else NEUTRAL)
+                why_str = " | ".join(cr.get("catalyst_why", [])[:2]) or "—"
+                st.markdown(
+                    f'<div style="background:{cc}12;border:1px solid {cc};'
+                    f'border-radius:4px;padding:5px 12px;margin:2px 0;font-size:0.78rem">'
+                    f'<b style="color:{cc}">{cr["ticker"]}</b>'
+                    f'&nbsp;— {cd} ({cb:+d})'
+                    f'&nbsp;|&nbsp;{why_str}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+
+# ── Whale Flow + Trade Coach Tab ──────────────────────────────────────────────
+
+def _render_whale_tab(selected: str):
+    """Render the Whale Flow & Trade Coach panel."""
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    st.markdown(
+        f'<span style="font-size:1.1rem;font-weight:bold;color:{GREEN}">'
+        f'Whale Flow & Trade Coach</span>',
+        unsafe_allow_html=True,
+    )
+    st.caption("Track unusual options activity, big money flow, and get coached on setups.")
+
+    # ── Settings row ──────────────────────────────────────────────────────────
+    # Sync whale ticker input with globally selected ticker
+    selected = st.session_state.selected_ticker
+    if st.session_state.get("_last_synced_ticker") != selected:
+        st.session_state["whale_ticker_input"] = selected
+        st.session_state["_last_synced_ticker"] = selected
+
+    set_c1, set_c2, set_c3, set_c4 = st.columns([2, 1.5, 1.5, 1])
+    with set_c1:
+        whale_ticker = st.text_input("Ticker", value=selected, key="whale_ticker_input")
+        whale_ticker = whale_ticker.upper().strip() if whale_ticker else selected
+    with set_c2:
+        account_val = st.number_input("Account Value ($)", value=100_000, step=5000, key="whale_acct")
+    with set_c3:
+        risk_pct = st.number_input("Risk per Trade (%)", value=1.0, step=0.25, min_value=0.25,
+                                    max_value=5.0, key="whale_risk")
+    with set_c4:
+        st.markdown("<br>", unsafe_allow_html=True)
+        scan_clicked = st.button("Analyze", key="whale_analyze_btn", type="primary")
+
+    if not scan_clicked and whale_ticker == selected:
+        # Auto-analyze selected ticker
+        pass
+
+    # ── Whale Detection ───────────────────────────────────────────────────────
+    with st.spinner(f"Scanning {whale_ticker} for whale activity..."):
+        whale_data = cached_whales(whale_ticker)
+
+    alert_level = whale_data.get("alert_level", "None")
+    whale_score = whale_data.get("whale_score", 0)
+    whale_dir = whale_data.get("whale_direction", "Neutral")
+
+    # Alert banner
+    if alert_level == "Whale Alert":
+        alert_color = GREEN if whale_dir == "Bullish" else RED
+        st.markdown(
+            f'<div style="background:{alert_color}18;border:2px solid {alert_color};'
+            f'border-radius:8px;padding:12px 18px;margin:8px 0;text-align:center">'
+            f'<span style="font-size:1.3rem;font-weight:bold;color:{alert_color}">'
+            f'WHALE ALERT — {whale_dir.upper()} (Score: {whale_score:+d})'
+            f'</span></div>',
+            unsafe_allow_html=True,
+        )
+        # Auto-log whale alert
+        _wkey = f"whale_{whale_ticker}_{datetime.now().strftime('%Y-%m-%d')}"
+        if _wkey not in st.session_state.logged_alerts_today:
+            log_alert(whale_ticker, "whale",
+                      f"WHALE ALERT {whale_ticker} — {whale_dir} (Score: {whale_score:+d})",
+                      score=abs(whale_score))
+            st.session_state.logged_alerts_today.add(_wkey)
+    elif alert_level == "Alert":
+        alert_color = YELLOW
+        st.markdown(
+            f'<div style="background:{alert_color}18;border:1px solid {alert_color};'
+            f'border-radius:6px;padding:10px 16px;margin:8px 0">'
+            f'<span style="font-size:1.1rem;font-weight:bold;color:{alert_color}">'
+            f'Alert: {whale_dir} unusual activity (Score: {whale_score:+d})'
+            f'</span></div>',
+            unsafe_allow_html=True,
+        )
+
+    # Squeeze alerts
+    squeeze = whale_data.get("squeeze", {})
+    gamma_risk = squeeze.get("gamma_squeeze_risk", "None")
+    short_risk = squeeze.get("short_squeeze_risk", "None")
+
+    if gamma_risk in ("High", "Moderate") or short_risk in ("High", "Moderate"):
+        # Auto-log squeeze alerts
+        _sqkey = f"squeeze_{whale_ticker}_{datetime.now().strftime('%Y-%m-%d')}"
+        if _sqkey not in st.session_state.logged_alerts_today:
+            parts = []
+            if gamma_risk in ("High", "Moderate"):
+                parts.append(f"Gamma {gamma_risk} ({squeeze.get('gamma_score', 0)})")
+            if short_risk in ("High", "Moderate"):
+                parts.append(f"Short {short_risk} ({squeeze.get('short_score', 0)})")
+            log_alert(whale_ticker, "squeeze",
+                      f"{whale_ticker} squeeze detected: {', '.join(parts)}",
+                      score=max(squeeze.get("gamma_score", 0), squeeze.get("short_score", 0)))
+            st.session_state.logged_alerts_today.add(_sqkey)
+
+        sq_cols = st.columns(2)
+        if gamma_risk in ("High", "Moderate"):
+            with sq_cols[0]:
+                gc = RED if gamma_risk == "High" else YELLOW
+                st.markdown(
+                    f'<div style="background:{gc}18;border:1px solid {gc};'
+                    f'border-radius:6px;padding:8px 14px;margin:4px 0">'
+                    f'<span style="font-size:0.95rem;font-weight:bold;color:{gc}">'
+                    f'GAMMA SQUEEZE — {gamma_risk.upper()} RISK (Score: {squeeze.get("gamma_score", 0)})</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+        if short_risk in ("High", "Moderate"):
+            col_idx = 1 if gamma_risk in ("High", "Moderate") else 0
+            with sq_cols[col_idx]:
+                sc = RED if short_risk == "High" else YELLOW
+                st.markdown(
+                    f'<div style="background:{sc}18;border:1px solid {sc};'
+                    f'border-radius:6px;padding:8px 14px;margin:4px 0">'
+                    f'<span style="font-size:0.95rem;font-weight:bold;color:{sc}">'
+                    f'SHORT SQUEEZE — {short_risk.upper()} RISK (Score: {squeeze.get("short_score", 0)})</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+    # Two columns: Options Flow | Volume & Institutional
+    wc1, wc2 = st.columns(2)
+
+    with wc1:
+        st.markdown(
+            f'<span style="font-size:0.9rem;font-weight:bold;color:{BLUE}">OPTIONS FLOW</span>',
+            unsafe_allow_html=True,
+        )
+        opt = whale_data.get("options_flow", {})
+        call_vol = opt.get("total_call_volume", 0)
+        put_vol = opt.get("total_put_volume", 0)
+        pc_ratio = opt.get("put_call_ratio")
+        pc_sig = opt.get("pc_signal", "Neutral")
+        call_prem = opt.get("total_call_premium", 0)
+        put_prem = opt.get("total_put_premium", 0)
+
+        mc1, mc2, mc3 = st.columns(3)
+        with mc1:
+            st.metric("Call Volume", f"{call_vol:,}")
+        with mc2:
+            st.metric("Put Volume", f"{put_vol:,}")
+        with mc3:
+            pc_str = f"{pc_ratio:.2f}" if pc_ratio is not None else "N/A"
+            st.metric("P/C Ratio", pc_str)
+
+        # Premium flow
+        mc4, mc5 = st.columns(2)
+        with mc4:
+            st.metric("Call Premium", f"${call_prem:,.0f}")
+        with mc5:
+            st.metric("Put Premium", f"${put_prem:,.0f}")
+
+        # Unusual contracts table
+        unusual = opt.get("unusual_contracts", [])
+        if unusual:
+            st.markdown(
+                f'<span style="font-size:0.78rem;font-weight:bold;color:{YELLOW}">'
+                f'UNUSUAL CONTRACTS ({len(unusual)})</span>',
+                unsafe_allow_html=True,
+            )
+            for uc in unusual[:8]:
+                side_c = GREEN if uc["side"] == "CALL" else RED
+                sweep_tag = " [SWEEP]" if uc.get("is_sweep") else ""
+                vol_oi = f"Vol/OI: {uc['vol_oi_ratio']}x" if uc.get("vol_oi_ratio") else "New OI"
+                st.markdown(
+                    f'<div style="background:{BG2};border-left:3px solid {side_c};'
+                    f'padding:4px 10px;margin:2px 0;font-family:monospace;font-size:0.75rem">'
+                    f'<b style="color:{side_c}">{uc["side"]}</b> '
+                    f'${uc["strike"]:.0f} exp {uc["expiration"]} '
+                    f'— Vol: {uc["volume"]:,} | {vol_oi} '
+                    f'| ${uc["dollar_value"]:,} '
+                    f'| IV: {uc["iv"]}%'
+                    f'<span style="color:{YELLOW}">{sweep_tag}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.caption("No unusual options activity detected.")
+
+    with wc2:
+        st.markdown(
+            f'<span style="font-size:0.9rem;font-weight:bold;color:{BLUE}">VOLUME & FLOW</span>',
+            unsafe_allow_html=True,
+        )
+        vol = whale_data.get("volume", {})
+        inst = whale_data.get("institutional", {})
+
+        vc1, vc2, vc3 = st.columns(3)
+        with vc1:
+            vr = vol.get("volume_ratio", 1.0)
+            vr_color = GREEN if vr >= 2 else (YELLOW if vr >= 1.5 else NEUTRAL)
+            st.metric("Vol Ratio", f"{vr:.1f}x")
+        with vc2:
+            st.metric("Signal", vol.get("volume_signal", "Normal"))
+        with vc3:
+            st.metric("Pattern", vol.get("accumulation", "Neutral"))
+
+        ic1, ic2 = st.columns(2)
+        with ic1:
+            inst_pct = inst.get("institutional_pct")
+            st.metric("Inst. Own %", f"{inst_pct:.0f}%" if inst_pct else "N/A")
+        with ic2:
+            st.metric("Inst. Activity", inst.get("recent_institutional_change", "Unknown"))
+
+        if vol.get("block_detected"):
+            st.markdown(
+                f'<div style="background:{YELLOW}18;border:1px solid {YELLOW};'
+                f'border-radius:4px;padding:6px 12px;margin:4px 0;font-size:0.8rem;'
+                f'color:{YELLOW}">Block trade detected in recent sessions</div>',
+                unsafe_allow_html=True,
+            )
+
+        # Signal summary
+        whale_sigs = whale_data.get("whale_signals", [])
+        if whale_sigs:
+            st.markdown(
+                f'<span style="font-size:0.78rem;font-weight:bold;color:{YELLOW}">SIGNALS</span>',
+                unsafe_allow_html=True,
+            )
+            for ws in whale_sigs:
+                sig_c = GREEN if "bullish" in ws.lower() or "accumulation" in ws.lower() \
+                    else (RED if "bearish" in ws.lower() or "distribution" in ws.lower() else NEUTRAL)
+                st.markdown(
+                    f'<div style="font-family:monospace;font-size:0.74rem;color:{sig_c};'
+                    f'padding:1px 0">* {ws}</div>',
+                    unsafe_allow_html=True,
+                )
+
+    # ── Trade Coach ───────────────────────────────────────────────────────────
+    st.divider()
+    st.markdown(
+        f'<span style="font-size:1.0rem;font-weight:bold;color:{GREEN}">TRADE COACH</span>',
+        unsafe_allow_html=True,
+    )
+
+    with st.spinner(f"Analyzing trade setup for {whale_ticker}..."):
+        coach = cached_trade_coach(whale_ticker, account_value=account_val, risk_pct=risk_pct)
+
+    verdict = coach.get("verdict", "NO TRADE")
+    direction = coach.get("direction", "Neutral")
+    grade = coach.get("grade", "F")
+    confidence = coach.get("confidence", 0)
+
+    # Verdict banner
+    if "TAKE THE TRADE" in verdict:
+        v_color = GREEN
+    elif "CAUTION" in verdict:
+        v_color = YELLOW
+    elif "RISKY" in verdict:
+        v_color = RED
+    else:
+        v_color = NEUTRAL
+
+    dir_word = "LONG" if direction == "Long" else ("SHORT" if direction == "Short" else "NO TRADE")
+    st.markdown(
+        f'<div style="background:{v_color}18;border:2px solid {v_color};'
+        f'border-radius:8px;padding:14px 20px;margin:8px 0;'
+        f'display:flex;justify-content:space-between;align-items:center">'
+        f'<span style="font-size:1.2rem;font-weight:bold;color:{v_color}">'
+        f'{verdict}</span>'
+        f'<span style="font-size:1.0rem;color:{v_color}">'
+        f'{dir_word} | Grade: {grade} | Confidence: {confidence}/100</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Trade levels — only show if there's a trade
+    if coach.get("entry") is not None:
+        tc1, tc2, tc3, tc4, tc5 = st.columns(5)
+        with tc1:
+            st.metric("Entry", f"${coach['entry']:.2f}")
+        with tc2:
+            st.metric("Stop Loss", f"${coach['stop_loss']:.2f}",
+                       delta=f"-${coach['risk_per_share']:.2f}")
+        with tc3:
+            st.metric("Take Profit", f"${coach['take_profit']:.2f}",
+                       delta=f"+${coach['reward_per_share']:.2f}")
+        with tc4:
+            rr = coach.get("risk_reward", 0)
+            rr_color = "normal" if rr >= 2 else ("off" if rr >= 1.5 else "off")
+            st.metric("Risk/Reward", f"1:{rr:.1f}")
+        with tc5:
+            st.metric("Shares", f"{coach['position_size']}")
+
+        tc6, tc7 = st.columns(2)
+        with tc6:
+            st.metric("If Wrong (Loss)", f"-${coach['dollar_risk']:,.0f}")
+        with tc7:
+            potential_gain = coach["position_size"] * coach["reward_per_share"]
+            st.metric("If Right (Gain)", f"+${potential_gain:,.0f}")
+
+        # ── Execute Trade Button ──────────────────────────────────────────────
+        side = "buy" if direction == "Long" else "sell"
+        btn_label = f"Execute {side.upper()} {whale_ticker} — {coach['position_size']} shares @ ${coach['entry']:.2f}"
+        exec_key = f"exec_coach_{whale_ticker}"
+        if st.button(btn_label, key=exec_key, type="primary"):
+            with st.spinner("Placing bracket order..."):
+                result = place_bracket_order(
+                    ticker=whale_ticker,
+                    qty=coach["position_size"],
+                    side=side,
+                    limit_price=coach["entry"],
+                    stop_loss=coach["stop_loss"],
+                    take_profit=coach["take_profit"],
+                )
+            if result.get("error"):
+                st.error(f"Order failed: {result['error']}")
+            else:
+                st.success(
+                    f"Bracket order placed! {result['status'].upper()} — "
+                    f"Entry ${coach['entry']:.2f} | SL ${coach['stop_loss']:.2f} | "
+                    f"TP ${coach['take_profit']:.2f} | {coach['position_size']} shares"
+                )
+                log_trade(whale_ticker, coach["entry"], coach["position_size"], side,
+                          strategy_notes=f"Trade coach bracket. SL=${coach['stop_loss']:.2f} TP=${coach['take_profit']:.2f}")
+                if result.get("legs"):
+                    for leg in result["legs"]:
+                        st.caption(f"  Leg {leg['id']}: {leg['type']} {leg['side']} — {leg['status']}")
+
+    # Coaching text
+    coaching_lines = coach.get("coaching", [])
+    if coaching_lines:
+        coach_text = "\n".join(coaching_lines)
+        st.code(coach_text, language=None)
+
+    # Signals breakdown
+    sc1, sc2 = st.columns(2)
+    with sc1:
+        st.markdown(
+            f'<span style="font-size:0.82rem;font-weight:bold;color:{GREEN}">SIGNALS FOR</span>',
+            unsafe_allow_html=True,
+        )
+        for sf in coach.get("signals_for", []):
+            st.markdown(
+                f'<div style="font-size:0.74rem;color:{GREEN};padding:1px 0;'
+                f'font-family:monospace">+ {sf}</div>',
+                unsafe_allow_html=True,
+            )
+    with sc2:
+        st.markdown(
+            f'<span style="font-size:0.82rem;font-weight:bold;color:{RED}">SIGNALS AGAINST</span>',
+            unsafe_allow_html=True,
+        )
+        for sa in coach.get("signals_against", []):
+            st.markdown(
+                f'<div style="font-size:0.74rem;color:{RED};padding:1px 0;'
+                f'font-family:monospace">- {sa}</div>',
+                unsafe_allow_html=True,
+            )
+
+    # ── News & Catalysts ─────────────────────────────────────────────────────
+    st.divider()
+    st.markdown(
+        f'<span style="font-size:1.0rem;font-weight:bold;color:{YELLOW}">NEWS & CATALYSTS — {whale_ticker}</span>',
+        unsafe_allow_html=True,
+    )
+    news_c1, news_c2 = st.columns(2)
+    with news_c1:
+        try:
+            _wt_sent = cached_sentiment(whale_ticker)
+            _wt_yhl = (_wt_sent.get("yahoo_headlines") or [])[:5]
+            if _wt_yhl:
+                for hl in _wt_yhl:
+                    sc_val = hl.get("score")
+                    sc_c = GREEN if sc_val and sc_val > 0.1 else (RED if sc_val and sc_val < -0.1 else NEUTRAL)
+                    sc_str = f" ({sc_val:+.2f})" if sc_val is not None else ""
+                    title = hl.get("title", "")[:70]
+                    url = hl.get("url", "#") or "#"
+                    st.markdown(
+                        f'<div style="font-size:0.72rem;padding:2px 0">'
+                        f'<a href="{url}" target="_blank" style="color:#ccc;text-decoration:none">'
+                        f'{title}</a>'
+                        f'<span style="color:{sc_c};font-size:0.65rem">{sc_str}</span>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.caption("No Yahoo headlines.")
+        except Exception:
+            st.caption("Headlines unavailable.")
+    with news_c2:
+        try:
+            _wt_cats = cached_catalysts(whale_ticker)
+            if _wt_cats and _wt_cats.get("catalysts"):
+                for cat in _wt_cats["catalysts"][:5]:
+                    cat_type = cat.get("type", "")
+                    cat_desc = cat.get("description", "")[:60]
+                    cat_date = cat.get("date", "")
+                    cat_c = YELLOW if "earnings" in cat_type.lower() else GREEN
+                    st.markdown(
+                        f'<div style="font-size:0.72rem;padding:2px 0">'
+                        f'<span style="color:{cat_c};font-weight:bold">[{cat_type}]</span> '
+                        f'<span style="color:#ccc">{cat_desc}</span>'
+                        f'{" — " + cat_date if cat_date else ""}'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.caption("No upcoming catalysts detected.")
+        except Exception:
+            st.caption("Catalyst data unavailable.")
+
+    # ── Best Trades Now ─────────────────────────────────────────────────────
+    st.divider()
+    st.markdown(
+        f'<span style="font-size:1.0rem;font-weight:bold;color:{GREEN}">BEST TRADES RIGHT NOW</span>',
+        unsafe_allow_html=True,
+    )
+    st.caption("Scanning watchlist + top movers for actionable setups...")
+
+    watchlist = load_watchlist()
+    # Add top movers to scan pool
+    try:
+        movers = cached_screener_movers()
+        mover_tickers = [r["ticker"] for r in (movers.get("gainers", [])[:5] + movers.get("losers", [])[:5])]
+    except Exception:
+        mover_tickers = []
+    scan_pool = list(dict.fromkeys(watchlist + mover_tickers))  # dedupe, preserve order
+
+    best_trades = []
+    squeeze_alerts = []
+    for st_ticker in scan_pool:
+        try:
+            coach_result = cached_trade_coach(st_ticker, account_value=account_val, risk_pct=risk_pct)
+            whale_result = cached_whales(st_ticker)
+            coach_result["_whale"] = whale_result
+
+            # Collect squeeze alerts
+            sq = whale_result.get("squeeze", {})
+            if sq.get("gamma_squeeze_risk") in ("High", "Moderate"):
+                squeeze_alerts.append({
+                    "ticker": st_ticker, "type": "GAMMA",
+                    "risk": sq["gamma_squeeze_risk"], "score": sq["gamma_score"],
+                    "signals": sq.get("squeeze_signals", []),
+                })
+            if sq.get("short_squeeze_risk") in ("High", "Moderate"):
+                squeeze_alerts.append({
+                    "ticker": st_ticker, "type": "SHORT",
+                    "risk": sq["short_squeeze_risk"], "score": sq["short_score"],
+                    "signals": sq.get("squeeze_signals", []),
+                })
+
+            if coach_result.get("verdict") != "NO TRADE" and coach_result.get("entry") and coach_result.get("direction") == "Long":
+                best_trades.append(coach_result)
+        except Exception:
+            continue
+
+    # Sort by grade then confidence
+    grade_order = {"A": 0, "B": 1, "C": 2, "D": 3, "F": 4}
+    best_trades.sort(key=lambda x: (grade_order.get(x["grade"], 4), -x["confidence"]))
+
+    # Squeeze alerts section
+    if squeeze_alerts:
+        st.markdown(
+            f'<span style="font-size:0.85rem;font-weight:bold;color:{RED}">SQUEEZE ALERTS</span>',
+            unsafe_allow_html=True,
+        )
+        for sa in squeeze_alerts:
+            sa_c = RED if sa["risk"] == "High" else YELLOW
+            top_reason = sa["signals"][0] if sa["signals"] else ""
+            st.markdown(
+                f'<div style="background:{sa_c}15;border-left:3px solid {sa_c};'
+                f'padding:5px 12px;margin:2px 0;font-family:monospace;font-size:0.78rem">'
+                f'<b style="color:{sa_c}">{sa["ticker"]}</b> — '
+                f'{sa["type"]} SQUEEZE {sa["risk"].upper()} (Score: {sa["score"]})'
+                f'&nbsp;| {top_reason}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        st.markdown("<br>", unsafe_allow_html=True)
+
+    if best_trades:
+        for bt in best_trades[:5]:
+            dir_word = "LONG" if bt["direction"] == "Long" else "SHORT"
+            bt_color = GREEN if bt["grade"] in ("A", "B") else (YELLOW if bt["grade"] == "C" else RED)
+            whale_info = bt.get("_whale", {})
+            whale_badge = ""
+            if whale_info.get("alert_level") in ("Whale Alert", "Alert"):
+                whale_badge = f' | Whale: {whale_info["whale_direction"]} ({whale_info["whale_score"]:+d})'
+
+            st.markdown(
+                f'<div style="background:{bt_color}12;border:1px solid {bt_color};'
+                f'border-radius:6px;padding:10px 16px;margin:4px 0">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                f'<span style="font-size:1.0rem;font-weight:bold;color:{bt_color}">'
+                f'{bt["ticker"]} — {dir_word} | Grade {bt["grade"]}</span>'
+                f'<span style="color:{NEUTRAL};font-size:0.82rem">'
+                f'Confidence: {bt["confidence"]}/100{whale_badge}</span>'
+                f'</div>'
+                f'<div style="font-family:monospace;font-size:0.78rem;color:#ccc;margin-top:4px">'
+                f'Entry: ${bt["entry"]:.2f} | Stop: ${bt["stop_loss"]:.2f} | '
+                f'Target: ${bt["take_profit"]:.2f} | R:R 1:{bt["risk_reward"]:.1f} | '
+                f'{bt["position_size"]} shares (${bt["dollar_risk"]:,.0f} risk)'
+                f'</div>'
+                f'<div style="font-size:0.72rem;color:{NEUTRAL};margin-top:2px">'
+                f'{bt["signals_for"][0] if bt["signals_for"] else ""}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+    else:
+        st.caption("No actionable setups found right now. Check back during market hours.")
+
+    # ── Watchlist Whale Scan ─────────────────────────────────────────────────
+    st.divider()
+    st.markdown(
+        f'<span style="font-size:0.9rem;font-weight:bold;color:{BLUE}">WATCHLIST WHALE SCAN</span>',
+        unsafe_allow_html=True,
+    )
+    st.caption("Scanning your watchlist for unusual activity...")
+
+    watchlist = load_watchlist()
+    if watchlist:
+        whale_results = []
+        for wt in watchlist:
+            try:
+                wd = cached_whales(wt)
+                if wd.get("whale_signals"):
+                    whale_results.append(wd)
+            except Exception:
+                continue
+
+        whale_results.sort(key=lambda r: abs(r["whale_score"]), reverse=True)
+
+        if whale_results:
+            for wr in whale_results:
+                ws = wr["whale_score"]
+                wd = wr["whale_direction"]
+                wc = GREEN if wd == "Bullish" else (RED if wd == "Bearish" else NEUTRAL)
+                alert = wr.get("alert_level", "None")
+                alert_badge = ""
+                if alert == "Whale Alert":
+                    alert_badge = " [WHALE]"
+                elif alert == "Alert":
+                    alert_badge = " [ALERT]"
+                top_sig = wr["whale_signals"][0] if wr["whale_signals"] else ""
+
+                st.markdown(
+                    f'<div style="background:{BG2};border-left:3px solid {wc};'
+                    f'padding:6px 12px;margin:3px 0;font-family:monospace;font-size:0.78rem">'
+                    f'<b style="color:{wc}">{wr["ticker"]}</b>'
+                    f'<span style="color:{wc}"> {wd} ({ws:+d}){alert_badge}</span>'
+                    f'&nbsp;— {top_sig}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.caption("No unusual activity detected in your watchlist.")
+    else:
+        st.caption("No tickers in watchlist. Add some from the Market View or Screener tab.")
+
+
+# ── Squeeze Scanner Tab ───────────────────────────────────────────────────────
+
+def _render_squeeze_tab(selected: str):
+    """Dedicated squeeze scanner — gamma and short squeeze detection across the market."""
+
+    st.markdown(
+        f'<span style="font-size:1.1rem;font-weight:bold;color:{RED}">'
+        f'Squeeze Scanner</span>',
+        unsafe_allow_html=True,
+    )
+    st.caption("Scanning for gamma squeeze and short squeeze setups across watchlist + top movers.")
+
+    # Build scan universe: watchlist + top movers + unusual volume
+    watchlist = load_watchlist()
+    try:
+        movers = cached_screener_movers()
+        mover_tickers = [r["ticker"] for r in (movers.get("gainers", [])[:10] + movers.get("losers", [])[:5])]
+    except Exception:
+        mover_tickers = []
+    try:
+        unusual = cached_unusual_volume()
+        unusual_tickers = [r["ticker"] for r in unusual[:10]]
+    except Exception:
+        unusual_tickers = []
+
+    scan_universe = list(dict.fromkeys(watchlist + mover_tickers + unusual_tickers))
+
+    col_refresh, col_count = st.columns([1, 5])
+    with col_refresh:
+        if st.button("Rescan", key="squeeze_rescan", type="primary"):
+            cached_whales.clear()
+            st.rerun()
+    with col_count:
+        st.caption(f"Scanning {len(scan_universe)} tickers...")
+
+    # Scan all tickers
+    gamma_candidates = []
+    short_candidates = []
+    all_squeeze_data = []
+
+    progress = st.progress(0, text="Scanning...")
+    for i, stk in enumerate(scan_universe):
+        progress.progress((i + 1) / len(scan_universe), text=f"Scanning {stk}... ({i+1}/{len(scan_universe)})")
+        try:
+            wd = cached_whales(stk)
+            sq = wd.get("squeeze", {})
+            whale_score = wd.get("whale_score", 0)
+            whale_dir = wd.get("whale_direction", "Neutral")
+
+            entry = {
+                "ticker": stk,
+                "whale_score": whale_score,
+                "whale_direction": whale_dir,
+                "alert_level": wd.get("alert_level", "None"),
+                "gamma_risk": sq.get("gamma_squeeze_risk", "None"),
+                "gamma_score": sq.get("gamma_score", 0),
+                "short_risk": sq.get("short_squeeze_risk", "None"),
+                "short_score": sq.get("short_score", 0),
+                "squeeze_signals": sq.get("squeeze_signals", []),
+                "options_flow": wd.get("options_flow", {}),
+                "volume": wd.get("volume", {}),
+            }
+            all_squeeze_data.append(entry)
+
+            if sq.get("gamma_squeeze_risk") in ("High", "Moderate", "Low"):
+                gamma_candidates.append(entry)
+            if sq.get("short_squeeze_risk") in ("High", "Moderate", "Low"):
+                short_candidates.append(entry)
+        except Exception:
+            continue
+
+    progress.empty()
+
+    gamma_candidates.sort(key=lambda x: x["gamma_score"], reverse=True)
+    short_candidates.sort(key=lambda x: x["short_score"], reverse=True)
+
+    # ── Summary metrics ──────────────────────────────────────────────────────
+    high_gamma = len([g for g in gamma_candidates if g["gamma_risk"] == "High"])
+    mod_gamma = len([g for g in gamma_candidates if g["gamma_risk"] == "Moderate"])
+    high_short = len([s for s in short_candidates if s["short_risk"] == "High"])
+    mod_short = len([s for s in short_candidates if s["short_risk"] == "Moderate"])
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("Gamma - High Risk", high_gamma)
+    with m2:
+        st.metric("Gamma - Moderate", mod_gamma)
+    with m3:
+        st.metric("Short - High Risk", high_short)
+    with m4:
+        st.metric("Short - Moderate", mod_short)
+
+    # ── Best Squeeze Setups (Ranked) ─────────────────────────────────────────
+    # Combine all squeeze candidates (High + Moderate only), run trade coach, rank by R:R
+    top_squeeze = []
+    seen_tickers = set()
+    for c in gamma_candidates + short_candidates:
+        if c["ticker"] in seen_tickers:
+            continue
+        risk = c.get("gamma_risk", "None") if c in gamma_candidates else c.get("short_risk", "None")
+        if risk not in ("High", "Moderate"):
+            continue
+        seen_tickers.add(c["ticker"])
+        top_squeeze.append(c)
+
+    if top_squeeze:
+        st.markdown(
+            f'<div style="margin-top:8px"><span style="font-size:1.0rem;font-weight:bold;'
+            f'color:{GREEN}">BEST SQUEEZE SETUPS — RANKED BY RISK/REWARD</span></div>',
+            unsafe_allow_html=True,
+        )
+        st.caption("Trade coach analysis on every High/Moderate squeeze candidate.")
+
+        setup_rows = []
+        for sq_c in top_squeeze:
+            try:
+                # Get account settings from session or defaults
+                acct = st.session_state.get("whale_acct", 100_000) or 100_000
+                rpct = st.session_state.get("whale_risk", 1.0) or 1.0
+                coach = cached_trade_coach(sq_c["ticker"], account_value=float(acct), risk_pct=float(rpct))
+                squeeze_type = []
+                if sq_c.get("gamma_risk") in ("High", "Moderate"):
+                    squeeze_type.append(f"Gamma {sq_c['gamma_risk']}")
+                if sq_c.get("short_risk") in ("High", "Moderate"):
+                    squeeze_type.append(f"Short {sq_c['short_risk']}")
+                coach["_squeeze_type"] = " + ".join(squeeze_type)
+                coach["_whale_score"] = sq_c.get("whale_score", 0)
+                coach["_whale_dir"] = sq_c.get("whale_direction", "Neutral")
+                coach["_gamma_score"] = sq_c.get("gamma_score", 0)
+                coach["_short_score"] = sq_c.get("short_score", 0)
+                setup_rows.append(coach)
+            except Exception:
+                continue
+
+        # Long only — filter out shorts and no-trade
+        setup_rows = [s for s in setup_rows if s.get("direction") == "Long"]
+
+        # Rank: grade first, then R:R, then confidence
+        grade_rank = {"A": 0, "B": 1, "C": 2, "D": 3, "F": 4}
+        setup_rows.sort(key=lambda x: (
+            grade_rank.get(x.get("grade", "F"), 4),
+            -(x.get("risk_reward", 0)),
+            -(x.get("confidence", 0)),
+        ))
+
+        for rank, sr in enumerate(setup_rows, 1):
+            ticker = sr["ticker"]
+            grade = sr.get("grade", "F")
+            verdict = sr.get("verdict", "NO TRADE")
+            direction = sr.get("direction", "Neutral")
+            rr = sr.get("risk_reward", 0)
+            conf = sr.get("confidence", 0)
+            entry = sr.get("entry")
+            stop = sr.get("stop_loss")
+            tp = sr.get("take_profit")
+            shares = sr.get("position_size", 0)
+            d_risk = sr.get("dollar_risk", 0)
+            d_reward = shares * sr.get("reward_per_share", 0) if shares else 0
+            sq_type = sr.get("_squeeze_type", "")
+            w_score = sr.get("_whale_score", 0)
+            w_dir = sr.get("_whale_dir", "Neutral")
+
+            # Colors
+            if grade in ("A", "B"):
+                card_color = GREEN
+            elif grade == "C":
+                card_color = YELLOW
+            else:
+                card_color = RED
+
+            dir_word = "LONG" if direction == "Long" else ("SHORT" if direction == "Short" else "—")
+            whale_c = GREEN if w_dir == "Bullish" else (RED if w_dir == "Bearish" else NEUTRAL)
+
+            # Entry/stop/target line
+            if entry is not None:
+                levels_str = (
+                    f'Entry: ${entry:.2f} | Stop: ${stop:.2f} | Target: ${tp:.2f} | '
+                    f'R:R 1:{rr:.1f} | {shares} shares | '
+                    f'Risk: ${d_risk:,.0f} | Reward: ${d_reward:,.0f}'
+                )
+            else:
+                levels_str = "No clear entry — wait for setup"
+
+            # Top reason
+            top_for = sr.get("signals_for", [""])[0] if sr.get("signals_for") else ""
+
+            # Card + Trade button side by side
+            card_col, btn_col = st.columns([6, 1])
+            with card_col:
+                st.markdown(
+                    f'<div style="background:{card_color}10;border:1px solid {card_color};'
+                    f'border-radius:8px;padding:12px 18px;margin:6px 0">'
+                    f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                    f'<span style="font-size:1.1rem;font-weight:bold;color:{card_color}">'
+                    f'#{rank} {ticker} — {dir_word} | Grade {grade}'
+                    f'</span>'
+                    f'<span style="font-size:0.82rem">'
+                    f'<span style="color:{card_color}">{verdict}</span>'
+                    f' | Conf: {conf}/100'
+                    f' | <span style="color:{whale_c}">Whale {w_dir} ({w_score:+d})</span>'
+                    f'</span>'
+                    f'</div>'
+                    f'<div style="font-size:0.72rem;color:{YELLOW};margin:3px 0">{sq_type}</div>'
+                    f'<div style="font-family:monospace;font-size:0.8rem;color:#ddd;margin:4px 0">'
+                    f'{levels_str}'
+                    f'</div>'
+                    f'<div style="font-size:0.72rem;color:{NEUTRAL};margin-top:2px">{top_for}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+            with btn_col:
+                if entry is not None and shares > 0:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    side = "buy" if direction == "Long" else "sell"
+                    confirm_key = f"squeeze_confirm_{ticker}"
+                    # Two-step: Trade → Confirm
+                    if st.session_state.get(confirm_key):
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            if st.button("Confirm", key=f"squeeze_yes_{ticker}", type="primary"):
+                                with st.spinner("Placing order..."):
+                                    result = place_bracket_order(
+                                        ticker=ticker,
+                                        qty=shares,
+                                        side=side,
+                                        limit_price=entry,
+                                        stop_loss=stop,
+                                        take_profit=tp,
+                                    )
+                                if result.get("error"):
+                                    st.error(f"Failed: {result['error']}")
+                                else:
+                                    st.success(f"Bracket order placed! {side.upper()} {shares} {ticker} @ ${entry:.2f}")
+                                    log_trade(ticker, entry, shares, side,
+                                              strategy_notes=f"Squeeze scanner bracket. SL=${stop:.2f} TP=${tp:.2f}")
+                                st.session_state[confirm_key] = False
+                        with c2:
+                            if st.button("Cancel", key=f"squeeze_no_{ticker}"):
+                                st.session_state[confirm_key] = False
+                                st.rerun()
+                    else:
+                        if st.button("Trade", key=f"squeeze_trade_{ticker}", type="primary"):
+                            st.session_state[confirm_key] = True
+                            st.rerun()
+
+    # ── Gamma Squeeze Section ────────────────────────────────────────────────
+    st.markdown(
+        f'<div style="margin-top:12px"><span style="font-size:1.0rem;font-weight:bold;color:{RED}">'
+        f'GAMMA SQUEEZE CANDIDATES</span></div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Gamma squeeze = massive call OI near current price forces market makers to buy shares "
+        "to hedge, creating a self-reinforcing price surge."
+    )
+
+    if gamma_candidates:
+        for gc in gamma_candidates:
+            risk = gc["gamma_risk"]
+            score = gc["gamma_score"]
+            gc_color = RED if risk == "High" else (YELLOW if risk == "Moderate" else NEUTRAL)
+
+            # Options flow context
+            opt = gc.get("options_flow", {})
+            call_vol = opt.get("total_call_volume", 0)
+            put_vol = opt.get("total_put_volume", 0)
+            pc = opt.get("put_call_ratio")
+            call_prem = opt.get("total_call_premium", 0)
+            whale_badge = ""
+            if gc["alert_level"] in ("Whale Alert", "Alert"):
+                whale_badge = (
+                    f'<span style="color:{GREEN if gc["whale_direction"] == "Bullish" else RED};'
+                    f'margin-left:8px;font-size:0.72rem">'
+                    f'Whale: {gc["whale_direction"]} ({gc["whale_score"]:+d})</span>'
+                )
+
+            st.markdown(
+                f'<div style="background:{gc_color}12;border:1px solid {gc_color};'
+                f'border-radius:6px;padding:10px 16px;margin:6px 0">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                f'<span style="font-size:1.05rem;font-weight:bold;color:{gc_color}">'
+                f'{gc["ticker"]} — GAMMA {risk.upper()} (Score: {score}/100)</span>'
+                f'{whale_badge}'
+                f'</div>'
+                f'<div style="font-family:monospace;font-size:0.76rem;color:#bbb;margin-top:4px">'
+                f'Calls: {call_vol:,} | Puts: {put_vol:,} | '
+                f'P/C: {f"{pc:.2f}" if pc is not None else "N/A"} | '
+                f'Call Premium: ${call_prem:,.0f}'
+                f'</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+            # Squeeze signals detail
+            for sig in gc["squeeze_signals"]:
+                if "gamma" in sig.lower() or "call" in sig.lower() or "sweep" in sig.lower():
+                    st.markdown(
+                        f'<div style="font-family:monospace;font-size:0.74rem;color:{gc_color};'
+                        f'padding:1px 0 1px 20px">* {sig}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+            # Trade idea
+            if risk in ("High", "Moderate"):
+                st.markdown(
+                    f'<div style="background:{BG2};border-radius:4px;padding:6px 14px;'
+                    f'margin:2px 0 8px 0;font-size:0.74rem;color:{NEUTRAL}">'
+                    f'<b>Trade idea:</b> Buy shares or near-ATM calls. '
+                    f'As price rises through strike clusters, market maker hedging '
+                    f'accelerates the move. Set stop below nearest support. '
+                    f'Take partial profits at each +5% level.</div>',
+                    unsafe_allow_html=True,
+                )
+    else:
+        st.caption("No gamma squeeze candidates detected in current scan.")
+
+    # ── Short Squeeze Section ────────────────────────────────────────────────
+    st.markdown(
+        f'<div style="margin-top:16px"><span style="font-size:1.0rem;font-weight:bold;color:{RED}">'
+        f'SHORT SQUEEZE CANDIDATES</span></div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Short squeeze = high short interest + rising price + volume surge forces short sellers "
+        "to cover (buy back shares), creating rapid price spikes."
+    )
+
+    if short_candidates:
+        for sc in short_candidates:
+            risk = sc["short_risk"]
+            score = sc["short_score"]
+            sc_color = RED if risk == "High" else (YELLOW if risk == "Moderate" else NEUTRAL)
+
+            vol_data = sc.get("volume", {})
+            vol_ratio = vol_data.get("volume_ratio", 1.0)
+            accum = vol_data.get("accumulation", "Neutral")
+            whale_badge = ""
+            if sc["alert_level"] in ("Whale Alert", "Alert"):
+                whale_badge = (
+                    f'<span style="color:{GREEN if sc["whale_direction"] == "Bullish" else RED};'
+                    f'margin-left:8px;font-size:0.72rem">'
+                    f'Whale: {sc["whale_direction"]} ({sc["whale_score"]:+d})</span>'
+                )
+
+            st.markdown(
+                f'<div style="background:{sc_color}12;border:1px solid {sc_color};'
+                f'border-radius:6px;padding:10px 16px;margin:6px 0">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                f'<span style="font-size:1.05rem;font-weight:bold;color:{sc_color}">'
+                f'{sc["ticker"]} — SHORT SQUEEZE {risk.upper()} (Score: {score}/100)</span>'
+                f'{whale_badge}'
+                f'</div>'
+                f'<div style="font-family:monospace;font-size:0.76rem;color:#bbb;margin-top:4px">'
+                f'Volume: {vol_ratio:.1f}x avg | Pattern: {accum}'
+                f'</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+            for sig in sc["squeeze_signals"]:
+                if "short" in sig.lower() or "cover" in sig.lower() or "days" in sig.lower() \
+                        or "interest" in sig.lower() or "price up" in sig.lower():
+                    st.markdown(
+                        f'<div style="font-family:monospace;font-size:0.74rem;color:{sc_color};'
+                        f'padding:1px 0 1px 20px">* {sig}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+            if risk in ("High", "Moderate"):
+                st.markdown(
+                    f'<div style="background:{BG2};border-radius:4px;padding:6px 14px;'
+                    f'margin:2px 0 8px 0;font-size:0.74rem;color:{NEUTRAL}">'
+                    f'<b>Trade idea:</b> Buy shares on volume confirmation. '
+                    f'Short squeezes are explosive but brief — set tight trailing stop. '
+                    f'Take 50% off at +10%, trail rest. '
+                    f'Do NOT hold overnight if momentum fades.</div>',
+                    unsafe_allow_html=True,
+                )
+    else:
+        st.caption("No short squeeze candidates detected in current scan.")
+
+    # ── Full Scan Table ──────────────────────────────────────────────────────
+    st.divider()
+    st.markdown(
+        f'<span style="font-size:0.9rem;font-weight:bold;color:{BLUE}">FULL SCAN RESULTS</span>',
+        unsafe_allow_html=True,
+    )
+
+    # Header
+    st.markdown(
+        '<div style="display:grid;'
+        'grid-template-columns:80px 75px 75px 75px 75px 1fr;'
+        'gap:4px;padding:5px 0 3px 0;'
+        'font-size:0.7rem;color:#555;font-weight:bold;'
+        'border-bottom:1px solid #2a2d35;font-family:monospace">'
+        '<span>TICKER</span>'
+        '<span>GAMMA</span>'
+        '<span>SHORT</span>'
+        '<span>WHALE</span>'
+        '<span>FLOW</span>'
+        '<span>TOP SIGNAL</span>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Sort by combined squeeze score
+    all_squeeze_data.sort(
+        key=lambda x: x["gamma_score"] + x["short_score"] + abs(x["whale_score"]),
+        reverse=True,
+    )
+
+    for row in all_squeeze_data:
+        gr = row["gamma_risk"]
+        sr = row["short_risk"]
+        gs = row["gamma_score"]
+        ss = row["short_score"]
+        ws = row["whale_score"]
+        wd = row["whale_direction"]
+
+        # Skip tickers with no meaningful activity
+        if gs == 0 and ss == 0 and abs(ws) < 30:
+            continue
+
+        g_color = RED if gr == "High" else (YELLOW if gr == "Moderate" else (NEUTRAL if gr == "Low" else "#333"))
+        s_color = RED if sr == "High" else (YELLOW if sr == "Moderate" else (NEUTRAL if sr == "Low" else "#333"))
+        w_color = GREEN if wd == "Bullish" else (RED if wd == "Bearish" else NEUTRAL)
+
+        g_str = f"{gs}" if gs > 0 else "—"
+        s_str = f"{ss}" if ss > 0 else "—"
+        w_str = f"{ws:+d}" if ws != 0 else "—"
+
+        top_sig = row["squeeze_signals"][0] if row["squeeze_signals"] else "—"
+        top_sig = top_sig[:70] + "..." if len(top_sig) > 70 else top_sig
+
+        flow_dir = row.get("options_flow", {}).get("flow_direction", "—")
+        flow_c = GREEN if flow_dir == "Bullish" else (RED if flow_dir == "Bearish" else NEUTRAL)
+
+        st.markdown(
+            f'<div style="display:grid;'
+            f'grid-template-columns:80px 75px 75px 75px 75px 1fr;'
+            f'gap:4px;padding:3px 0;'
+            f'font-size:0.76rem;font-family:monospace;'
+            f'border-bottom:1px solid #1a1d24">'
+            f'<span style="font-weight:bold;color:#ddd">{row["ticker"]}</span>'
+            f'<span style="color:{g_color};font-weight:bold">{g_str}</span>'
+            f'<span style="color:{s_color};font-weight:bold">{s_str}</span>'
+            f'<span style="color:{w_color}">{w_str}</span>'
+            f'<span style="color:{flow_c}">{flow_dir}</span>'
+            f'<span style="color:{NEUTRAL};font-size:0.72rem">{top_sig}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
 
 
 # ── Portfolio Tab ─────────────────────────────────────────────────────────────
@@ -1614,13 +2825,15 @@ def _render_portfolio_tab():
         st.error(f"Alpaca connection error: {acct['error']}")
         st.caption("Check ALPACA_API_KEY and ALPACA_SECRET_KEY in your .env file.")
     else:
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3 = st.columns(3)
         with c1:
-            st.metric("Portfolio Value", f"${acct.get('portfolio_value', 0):,.2f}")
+            st.metric("Portfolio", f"${acct.get('portfolio_value', 0):,.0f}")
         with c2:
-            st.metric("Cash", f"${acct.get('cash', 0):,.2f}")
+            st.metric("Cash", f"${acct.get('cash', 0):,.0f}")
         with c3:
-            st.metric("Buying Power", f"${acct.get('buying_power', 0):,.2f}")
+            st.metric("Buying Power", f"${acct.get('buying_power', 0):,.0f}")
+
+        c4, c5 = st.columns(2)
         with c4:
             dpnl     = acct.get("daily_pnl", 0)
             dpnl_pct = acct.get("daily_pnl_pct", 0)
@@ -1733,40 +2946,87 @@ def _render_portfolio_tab():
     # Show pending order confirmation if one is queued
     if st.session_state.pending_order:
         po = st.session_state.pending_order
+        is_bracket = po.get("order_type") == "bracket"
         lp_str  = f"  |  Limit ${po['limit_price']:.2f}"  if po.get("limit_price") else ""
         sp_str  = f"  |  Stop ${po['stop_price']:.2f}"    if po.get("stop_price")  else ""
         est_val = (po.get("limit_price") or po.get("stop_price") or 0) * po["qty"]
         est_str = f"  |  Est. value ${est_val:,.2f}" if est_val else ""
-        st.warning(
-            f"Confirm:  **{po['side'].upper()}  {po['qty']} shares  {po['ticker']}**  "
-            f"|  {po['order_type'].upper()}{lp_str}{sp_str}{est_str}"
-        )
+
+        if is_bracket:
+            tp_price = po.get("_coach_tp", 0)
+            rr_val = po.get("_coach_rr", 0)
+            d_risk = po["qty"] * abs(po["limit_price"] - po["stop_price"])
+            d_reward = po["qty"] * abs(tp_price - po["limit_price"])
+            st.warning(
+                f"**BRACKET ORDER:  {po['side'].upper()}  {po['qty']} shares  {po['ticker']}**\n\n"
+                f"**Entry:** ${po['limit_price']:.2f} (limit)  |  "
+                f"**Stop Loss:** ${po['stop_price']:.2f}  |  "
+                f"**Take Profit:** ${tp_price:.2f}\n\n"
+                f"**R:R** 1:{rr_val:.1f}  |  "
+                f"**Risk:** ${d_risk:,.0f}  |  "
+                f"**Reward:** ${d_reward:,.0f}  |  "
+                f"**Position:** ${est_val:,.0f}\n\n"
+                f"*All 3 orders placed at once. When entry fills, stop loss and take profit go live. "
+                f"If one exit hits, the other auto-cancels.*"
+            )
+        else:
+            coach_str = ""
+            if po.get("_coach_tp"):
+                coach_str = (
+                    f"\n\n**Trade Coach levels:**  "
+                    f"Stop: ${po['stop_price']:.2f}  |  "
+                    f"Target: ${po['_coach_tp']:.2f}  |  "
+                    f"R:R 1:{po['_coach_rr']:.1f}"
+                )
+            st.warning(
+                f"Confirm:  **{po['side'].upper()}  {po['qty']} shares  {po['ticker']}**  "
+                f"|  {po['order_type'].upper()}{lp_str}{sp_str}{est_str}{coach_str}"
+            )
+
         conf_col, cancel_col = st.columns(2)
         with conf_col:
-            if st.button("✓ Confirm Order", key="order_confirm", use_container_width=True):
-                result = place_order(
-                    ticker      = po["ticker"],
-                    qty         = po["qty"],
-                    side        = po["side"],
-                    order_type  = po["order_type"],
-                    limit_price = po.get("limit_price"),
-                )
+            if st.button("Confirm Order", key="order_confirm", use_container_width=True):
+                if is_bracket:
+                    result = place_bracket_order(
+                        ticker      = po["ticker"],
+                        qty         = po["qty"],
+                        side        = po["side"],
+                        limit_price = po["limit_price"],
+                        stop_loss   = po["stop_price"],
+                        take_profit = po["_coach_tp"],
+                    )
+                else:
+                    result = place_order(
+                        ticker      = po["ticker"],
+                        qty         = po["qty"],
+                        side        = po["side"],
+                        order_type  = po["order_type"],
+                        limit_price = po.get("limit_price"),
+                    )
                 st.session_state.pending_order = None
                 if result.get("error"):
                     st.error(f"Order failed: {result['error']}")
                 else:
+                    notes = f"Bracket order via squeeze scanner. ID: {result.get('id','')}" if is_bracket \
+                        else f"Paper order via dashboard. ID: {result.get('id','')}"
                     log_trade(
                         ticker      = po["ticker"],
                         entry_price = po.get("limit_price") or po.get("stop_price") or 0.0,
                         qty         = po["qty"],
                         side        = po["side"],
-                        strategy_notes = f"Paper order via dashboard. ID: {result.get('id','')}",
+                        strategy_notes = notes,
                     )
                     cached_orders.clear()
                     cached_account.clear()
+                    legs = result.get("legs", [])
+                    leg_str = ""
+                    if legs:
+                        leg_str = " | Legs: " + ", ".join(
+                            f"{l['type']} {l['side']}" for l in legs
+                        )
                     st.success(
                         f"Order submitted! ID: {result.get('id','')[:8]}…  "
-                        f"Status: {result.get('status','')}"
+                        f"Status: {result.get('status','')}{leg_str}"
                     )
                     st.rerun()
         with cancel_col:
@@ -1934,6 +3194,7 @@ def _render_portfolio_tab():
     )
 
     orders = cached_orders(status="all", limit=15)
+    _stale_cutoff = (pd.Timestamp.now() - pd.tseries.offsets.BDay(1)).strftime("%Y-%m-%dT%H:%M:%S")
     if not orders:
         st.caption("No recent orders.")
     else:
@@ -1975,8 +3236,14 @@ def _render_portfolio_tab():
                 st.markdown(f'<span style="font-size:0.8rem">{o.get("order_type","")}</span>',
                             unsafe_allow_html=True)
             with oc5:
+                stale_badge = ""
+                if status == "new" and o.get("submitted_at", "") < _stale_cutoff:
+                    stale_badge = (
+                        ' <span style="background:#ff8c00;color:#000;font-size:0.6rem;'
+                        'padding:1px 4px;border-radius:3px;font-weight:bold">STALE</span>'
+                    )
                 st.markdown(
-                    f'<span style="color:{stat_c};font-size:0.8rem">{status}</span>',
+                    f'<span style="color:{stat_c};font-size:0.8rem">{status}{stale_badge}</span>',
                     unsafe_allow_html=True,
                 )
             with oc6:
@@ -2006,7 +3273,7 @@ def _render_portfolio_tab():
     else:
         pc1, pc2, pc3, pc4, pc5 = st.columns(5)
         with pc1:
-            st.metric("Total Trades", perf.get("total_trades", 0))
+            st.metric("Closed Trades", perf.get("closed_trades", 0))
         with pc2:
             wr = perf.get("win_rate")
             st.metric("Win Rate", f"{wr:.1f}%" if wr is not None else "N/A")
@@ -2031,6 +3298,182 @@ def _render_portfolio_tab():
             st.caption(f"Open: {perf.get('open_trades', 0)}")
 
 
+# ── Journal Tab ──────────────────────────────────────────────────────────────
+
+def _render_journal_tab():
+    """Trade journal with full history, P&L curve, and per-trade detail."""
+
+    st.markdown(
+        f'<span style="font-size:1.1rem;font-weight:bold;color:{GREEN}">TRADE JOURNAL</span>',
+        unsafe_allow_html=True,
+    )
+    st.caption("Full trade history, performance analytics, and alert log.")
+
+    # ── Performance Summary ───────────────────────────────────────────────
+    perf = get_performance_summary()
+    if perf.get("total_trades", 0) > 0:
+        pc1, pc2, pc3, pc4, pc5, pc6 = st.columns(6)
+        with pc1:
+            st.metric("Total Trades", perf.get("total_trades", 0))
+        with pc2:
+            wr = perf.get("win_rate")
+            st.metric("Win Rate", f"{wr:.1f}%" if wr is not None else "N/A")
+        with pc3:
+            tpnl = perf.get("total_pnl", 0)
+            sign = "+" if tpnl >= 0 else ""
+            pnl_c = "normal" if tpnl >= 0 else "off"
+            st.metric("Total P&L", f"{sign}${tpnl:,.2f}")
+        with pc4:
+            avg = perf.get("avg_pnl")
+            st.metric("Avg P&L", f"${avg:,.2f}" if avg is not None else "N/A")
+        with pc5:
+            best = perf.get("best_trade")
+            st.metric("Best Trade", f"+${best:,.2f}" if best is not None else "N/A")
+        with pc6:
+            worst = perf.get("worst_trade")
+            st.metric("Worst Trade", f"${worst:,.2f}" if worst is not None else "N/A")
+
+    # ── Trade History Table ───────────────────────────────────────────────
+    st.divider()
+    st.markdown(
+        f'<span style="font-size:0.85rem;font-weight:bold;color:{NEUTRAL}">TRADE HISTORY</span>',
+        unsafe_allow_html=True,
+    )
+
+    trades = get_all_trades(limit=100)
+    if not trades:
+        st.caption("No trades logged yet. Execute trades from Trade Coach or Squeeze Scanner.")
+    else:
+        # P&L curve for closed trades
+        closed = [t for t in trades if t["outcome"] != "open" and t["pnl"] is not None]
+        if closed:
+            closed_sorted = sorted(closed, key=lambda x: x["id"])
+            cumulative = []
+            running = 0
+            labels = []
+            for t in closed_sorted:
+                running += t["pnl"]
+                cumulative.append(running)
+                labels.append(f"#{t['id']} {t['ticker']}")
+
+            fig = go.Figure()
+            colors = [GREEN if v >= 0 else RED for v in cumulative]
+            fig.add_trace(go.Scatter(
+                x=labels, y=cumulative, mode="lines+markers",
+                line=dict(color=GREEN, width=2),
+                marker=dict(color=colors, size=6),
+                hovertemplate="Trade: %{x}<br>Cumulative P&L: $%{y:,.2f}<extra></extra>",
+            ))
+            fig.update_layout(
+                title="Cumulative P&L",
+                height=280, margin=dict(l=40, r=20, t=40, b=40),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#ccc", size=10),
+                xaxis=dict(showgrid=False), yaxis=dict(gridcolor="#2a2d35"),
+            )
+            fig.add_hline(y=0, line_dash="dash", line_color=NEUTRAL, opacity=0.5)
+            st.plotly_chart(fig, use_container_width=True)
+
+        # Trade table
+        for t in trades:
+            outcome = t["outcome"] or "open"
+            if outcome == "win":
+                oc = GREEN
+            elif outcome == "loss":
+                oc = RED
+            elif outcome == "open":
+                oc = YELLOW
+            else:
+                oc = NEUTRAL
+
+            pnl_str = ""
+            if t["pnl"] is not None:
+                s = "+" if t["pnl"] >= 0 else ""
+                pnl_str = f'{s}${t["pnl"]:,.2f}'
+                if t["pnl_percent"] is not None:
+                    pnl_str += f' ({s}{t["pnl_percent"]:.1f}%)'
+            else:
+                pnl_str = "Open"
+
+            notes = t.get("strategy_notes") or ""
+            notes_short = notes[:60] + "..." if len(notes) > 60 else notes
+
+            st.markdown(
+                f'<div style="background:{oc}08;border-left:3px solid {oc};'
+                f'border-radius:4px;padding:8px 14px;margin:4px 0;'
+                f'font-family:monospace;font-size:0.78rem">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                f'<span style="font-weight:bold;color:{oc}">'
+                f'#{t["id"]} {t["ticker"]} — {t["side"].upper()} {t["quantity"]} shares '
+                f'@ ${t["entry_price"]:.2f}</span>'
+                f'<span style="color:{oc}">{pnl_str}</span>'
+                f'</div>'
+                f'<div style="color:{NEUTRAL};font-size:0.68rem;margin-top:2px">'
+                f'Opened: {t["entry_date"][:16] if t["entry_date"] else "?"}'
+                f'{" | Closed: " + t["exit_date"][:16] if t.get("exit_date") else ""}'
+                f'{" | " + notes_short if notes_short else ""}'
+                f'</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+            # Close trade button for open trades
+            if outcome == "open":
+                cl1, cl2 = st.columns([4, 1])
+                with cl2:
+                    if st.button("Close Trade", key=f"close_trade_{t['id']}"):
+                        try:
+                            md = cached_market_data(t["ticker"])
+                            cur_price = float(md.get("live_price") or md.get("price_yf", {}).get("price") or 0)
+                            if cur_price > 0:
+                                close_trade(t["id"], cur_price)
+                                st.success(f"Closed #{t['id']} {t['ticker']} @ ${cur_price:.2f}")
+                                st.rerun()
+                            else:
+                                st.error("Could not get current price")
+                        except Exception as exc:
+                            st.error(f"Error: {exc}")
+
+    # ── Alert Log ─────────────────────────────────────────────────────────
+    st.divider()
+    al_hdr, al_btn = st.columns([5, 1])
+    with al_hdr:
+        st.markdown(
+            f'<span style="font-size:0.85rem;font-weight:bold;color:{YELLOW}">ALERT LOG</span>',
+            unsafe_allow_html=True,
+        )
+    with al_btn:
+        if st.button("Clear", key="clear_alerts"):
+            clear_alert_log()
+            st.rerun()
+
+    alerts = get_alert_log(limit=50)
+    if not alerts:
+        st.caption("No alerts logged yet. Alerts fire from scans, price levels, and regime changes.")
+    else:
+        for al in alerts:
+            atype = al["alert_type"]
+            if atype == "squeeze":
+                ac = RED
+            elif atype == "whale":
+                ac = GREEN
+            elif atype == "price":
+                ac = YELLOW
+            elif atype == "regime":
+                ac = YELLOW
+            else:
+                ac = NEUTRAL
+            st.markdown(
+                f'<div style="font-size:0.72rem;font-family:monospace;padding:3px 0;'
+                f'border-bottom:1px solid #1a1d25">'
+                f'<span style="color:{NEUTRAL}">{al["timestamp"][5:16]}</span> '
+                f'<span style="color:{ac};font-weight:bold">[{atype.upper()}]</span> '
+                f'<span style="color:#ddd">{al["message"]}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+
 # ── Main render ───────────────────────────────────────────────────────────────
 
 def render():
@@ -2046,15 +3489,49 @@ def render():
         st.caption(datetime.now().strftime("%a %b %d, %Y  %H:%M:%S"))
         st.divider()
 
+        # ── Recent Alerts (above watchlist) ─────────────────────────────────
+        recent_alerts = get_alert_log(limit=8)
+        if recent_alerts:
+            st.markdown(
+                f'<span style="color:{YELLOW};font-size:0.75rem;font-weight:bold">'
+                f'RECENT ALERTS</span>',
+                unsafe_allow_html=True,
+            )
+            for ra in recent_alerts:
+                atype = ra["alert_type"]
+                ac = RED if atype == "squeeze" else (GREEN if atype == "whale" else YELLOW)
+                ra_col1, ra_col2 = st.columns([4, 1])
+                with ra_col1:
+                    st.markdown(
+                        f'<div style="font-size:0.62rem;font-family:monospace;padding:1px 0;'
+                        f'color:#aaa">'
+                        f'<span style="color:{ac}">[{atype[:3].upper()}]</span> '
+                        f'{ra["message"][:42]}'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                with ra_col2:
+                    if st.button(ra["ticker"], key=f"alert_go_{ra['id']}", help=f"View {ra['ticker']}"):
+                        st.session_state.selected_ticker = ra["ticker"]
+                        st.rerun()
+            st.divider()
+
         watchlist = load_watchlist()
         st.markdown("**Watchlist** — sorted by anomaly score")
 
-        anomaly_map = {}
-        for wl_t in watchlist:
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _fetch_anomaly(ticker):
             try:
-                anomaly_map[wl_t] = cached_anomaly(wl_t)
+                return ticker, cached_anomaly(ticker)
             except Exception:
-                anomaly_map[wl_t] = {"score": 0, "is_watch": False, "reason": ""}
+                return ticker, {"score": 0, "is_watch": False, "reason": ""}
+
+        anomaly_map = {}
+        if watchlist:
+            with ThreadPoolExecutor(max_workers=min(len(watchlist), 6)) as pool:
+                for ticker, anom_result in pool.map(lambda t: _fetch_anomaly(t), watchlist):
+                    anomaly_map[ticker] = anom_result
 
         sorted_watchlist = sorted(
             watchlist,
@@ -2133,6 +3610,49 @@ def render():
                 )
             st.markdown(badge_html, unsafe_allow_html=True)
 
+        # ── Top Picks — auto-ranked best trades ────────────────────────────────
+        st.divider()
+        st.markdown(
+            f'<span style="color:{YELLOW};font-size:0.75rem;font-weight:bold">'
+            f'TOP PICKS — BEST TRADES NOW</span>',
+            unsafe_allow_html=True,
+        )
+        try:
+            _scan_results = cached_market_scan()
+            _top_picks = [r for r in _scan_results if r.get("ticker") not in set(watchlist) and r.get("direction") == "Long"][:8]
+            if _top_picks:
+                for _tp in _top_picks:
+                    _tp_ticker = _tp.get("ticker", "?")
+                    _tp_price  = _fmt_price(_tp.get("price"))
+                    _tp_chg    = _fmt_pct(_tp.get("change_pct"))
+                    _tp_score  = _tp.get("score", 0)
+                    _tp_dir    = _tp.get("direction", "")
+                    _tp_qual   = _tp.get("quality_score", 0)
+                    _tp_reason = _tp.get("reason", "")[:45]
+                    _dir_c     = GREEN if _tp_dir == "Long" else (RED if _tp_dir == "Short" else NEUTRAL)
+
+                    _tp_col1, _tp_col2 = st.columns([5, 1])
+                    with _tp_col1:
+                        _tp_label = f"  {_tp_ticker}  {_tp_price}  {_tp_chg}"
+                        if st.button(_tp_label, key=f"tp_{_tp_ticker}", width="stretch"):
+                            st.session_state.selected_ticker = _tp_ticker
+                            st.rerun()
+                    with _tp_col2:
+                        if st.button("+", key=f"tpa_{_tp_ticker}", help=f"Add {_tp_ticker} to watchlist"):
+                            add_ticker(_tp_ticker)
+                            st.rerun()
+                    _tp_html = (
+                        f'<span style="color:{_dir_c};font-size:0.65rem">{_tp_dir}</span> '
+                        f'<span style="color:{NEUTRAL};font-size:0.65rem">'
+                        f'[{_tp_score} sig] [Q:{_tp_qual}]</span>'
+                        f'<br><span style="color:{YELLOW};font-size:0.6rem">{_tp_reason}</span>'
+                    )
+                    st.markdown(_tp_html, unsafe_allow_html=True)
+            else:
+                st.caption("No top picks found — scan may still be loading")
+        except Exception:
+            st.caption("Scan loading...")
+
         # ── Add ticker to watchlist ───────────────────────────────────────────
         st.divider()
         st.markdown(
@@ -2153,6 +3673,66 @@ def render():
                 if t:
                     add_ticker(t)
                     st.session_state.selected_ticker = t
+                    st.rerun()
+
+        # ── Price Alerts ─────────────────────────────────────────────────────
+        st.divider()
+        st.markdown(
+            f'<span style="color:{YELLOW};font-size:0.75rem;font-weight:bold">'
+            f'PRICE ALERTS</span>',
+            unsafe_allow_html=True,
+        )
+
+        # Check triggered alerts
+        price_map = {}
+        for wl_t in watchlist:
+            try:
+                wl_md = cached_market_data(wl_t)
+                p = wl_md.get("live_price") or (wl_md.get("price_yf", {}) or {}).get("price")
+                if p:
+                    price_map[wl_t] = float(p)
+            except Exception:
+                pass
+        triggered = check_price_alerts(price_map)
+        for trig in triggered:
+            st.toast(f"{trig['ticker']} hit ${trig['current_price']:.2f}! "
+                     f"(Alert: {trig['direction']} ${trig['target_price']:.2f})")
+
+        # Show active alerts
+        active_alerts = get_price_alerts()
+        if active_alerts:
+            for pa in active_alerts:
+                pa_col1, pa_col2 = st.columns([4, 1])
+                with pa_col1:
+                    arrow = "^" if pa["direction"] == "above" else "v"
+                    pa_c = GREEN if pa["direction"] == "above" else RED
+                    st.markdown(
+                        f'<span style="color:{pa_c};font-size:0.7rem;font-family:monospace">'
+                        f'{arrow} {pa["ticker"]} {pa["direction"]} ${pa["target_price"]:.2f}'
+                        f'</span>',
+                        unsafe_allow_html=True,
+                    )
+                with pa_col2:
+                    if st.button("x", key=f"rma_{pa['id']}"):
+                        remove_price_alert(pa["id"])
+                        st.rerun()
+        else:
+            st.caption("No active price alerts.")
+
+        # Add new alert
+        with st.expander("Set Alert", expanded=False):
+            al_ticker = st.text_input("Ticker", value=selected, key="alert_ticker_input",
+                                       placeholder="AAPL")
+            al_price = st.number_input("Price", min_value=0.01, value=100.0,
+                                        step=0.50, key="alert_price_input")
+            al_dir = st.selectbox("When price goes", ["above", "below"], key="alert_dir_input")
+            al_note = st.text_input("Note (optional)", key="alert_note_input",
+                                     placeholder="e.g. breakout level")
+            if st.button("Set Alert", key="set_alert_btn", type="primary"):
+                t = (al_ticker or "").strip().upper()
+                if t and al_price > 0:
+                    add_price_alert(t, al_price, al_dir, al_note)
+                    st.success(f"Alert set: {t} {al_dir} ${al_price:.2f}")
                     st.rerun()
 
         st.divider()
@@ -2180,11 +3760,45 @@ def render():
                       value=m.get("display_value", "N/A"),
                       delta=m.get("change_display"))
 
+    # ── MARKET REGIME BANNER ────────────────────────────────────────────────
+    regime = cached_market_regime()
+    regime_name = regime.get("regime", "Unknown")
+    regime_c_map = {"green": GREEN, "red": RED, "yellow": YELLOW, "gray": NEUTRAL}
+    regime_color = regime_c_map.get(regime.get("color", "gray"), NEUTRAL)
+    spy_trend = regime.get("spy_trend", "?")
+    qqq_trend = regime.get("qqq_trend", "?")
+    vix_val = regime.get("vix_value", 0)
+    vix_lvl = regime.get("vix_level", "?")
+    spy_price = regime.get("spy_price", "")
+    spy_str = f"${spy_price}" if spy_price else ""
+    qqq_price = regime.get("qqq_price", "")
+    qqq_str = f"${qqq_price}" if qqq_price else ""
+
+    st.markdown(
+        f'<div style="background:{regime_color}10;border:1px solid {regime_color};'
+        f'border-radius:6px;padding:8px 16px;margin:4px 0;'
+        f'display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap">'
+        f'<span style="font-size:0.9rem;font-weight:bold;color:{regime_color}">'
+        f'MARKET REGIME: {regime_name}</span>'
+        f'<span style="font-size:0.72rem;color:{NEUTRAL}">'
+        f'SPY {spy_str} {spy_trend} &nbsp;|&nbsp; QQQ {qqq_str} {qqq_trend} '
+        f'&nbsp;|&nbsp; VIX {vix_val} ({vix_lvl})</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+    if regime.get("warning"):
+        st.markdown(
+            f'<div style="font-size:0.72rem;color:{regime_color};padding:2px 16px">'
+            f'{regime["warning"]}</div>',
+            unsafe_allow_html=True,
+        )
+
     st.divider()
 
     # ── TOP-LEVEL TABS ────────────────────────────────────────────────────────
-    tab_market, tab_screener, tab_portfolio, tab_backtest = st.tabs(
-        ["📊 Market View", "🔍 Screener", "💼 Portfolio", "📈 Backtest"]
+    tab_market, tab_screener, tab_whales, tab_squeeze, tab_portfolio, tab_backtest, tab_performance, tab_journal = st.tabs(
+        ["📊 Market View", "🔍 Screener", "🐋 Whale Flow", "🔥 Squeeze Scanner",
+         "💼 Portfolio", "📈 Backtest", "📊 Performance", "📒 Journal"]
     )
 
     with tab_market:
@@ -2193,19 +3807,28 @@ def render():
     with tab_screener:
         _render_screener_tab()
 
+    with tab_whales:
+        _render_whale_tab(selected)
+
+    with tab_squeeze:
+        _render_squeeze_tab(selected)
+
     with tab_portfolio:
         _render_portfolio_tab()
 
     with tab_backtest:
         render_backtest_tab()
 
+    with tab_performance:
+        render_performance_tab()
+
+    with tab_journal:
+        _render_journal_tab()
+
     # ── AUTO-REFRESH (outside tabs — fires regardless of active tab) ──────────
     if time.time() >= st.session_state.next_refresh:
         st.session_state.next_refresh = time.time() + 60
         st.rerun()
-
-    time.sleep(10)
-    st.rerun()
 
 
 render()
