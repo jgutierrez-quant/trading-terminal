@@ -13,8 +13,8 @@ env/
 # Environment variables (NEVER commit real keys)
 .env
 
-# Streamlit
-.streamlit/
+# Streamlit — track config.toml (no secrets), ignore credentials
+.streamlit/secrets.toml
 
 # OS
 .DS_Store
