@@ -11,3 +11,4 @@ pytrends
 beautifulsoup4
 lxml
 praw
+pandas-ta
