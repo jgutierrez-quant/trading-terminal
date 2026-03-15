@@ -40,6 +40,7 @@ from utils.risk_manager             import (calculate_position_size, calculate_s
                                             calculate_take_profit, validate_trade,
                                             get_market_hours)
 from utils.trade_logger             import log_signal, log_trade, get_performance_summary
+from dashboard.backtest_tab         import render_backtest_tab
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -1736,8 +1737,8 @@ def render():
     st.divider()
 
     # ── TOP-LEVEL TABS ────────────────────────────────────────────────────────
-    tab_market, tab_screener, tab_portfolio = st.tabs(
-        ["📊 Market View", "🔍 Screener", "💼 Portfolio"]
+    tab_market, tab_screener, tab_portfolio, tab_backtest = st.tabs(
+        ["📊 Market View", "🔍 Screener", "💼 Portfolio", "📈 Backtest"]
     )
 
     with tab_market:
@@ -1748,6 +1749,9 @@ def render():
 
     with tab_portfolio:
         _render_portfolio_tab()
+
+    with tab_backtest:
+        render_backtest_tab()
 
     # ── AUTO-REFRESH (outside tabs — fires regardless of active tab) ──────────
     if time.time() >= st.session_state.next_refresh:
