@@ -10,7 +10,7 @@ Public API:
     run_multi_backtest(tickers, ...)           -> pd.DataFrame
 
 Stage 9 changes vs Stage 8B:
-    - WATCH_THRESHOLD raised to 4 (matches anomaly_detector.py)
+    - WATCH_THRESHOLD = 3 (Stage 9c: back to 3, direction logic preserved)
     - Direction filter: Long only when price > SMA50; Short only below SMA50
     - Quality score (0-100) computed vectorized and stored per bar
     - quality_threshold parameter (default 60) — skip low-quality setups
@@ -35,7 +35,7 @@ import yfinance as yf
 logger = logging.getLogger(__name__)
 
 # ── Constants (match anomaly_detector.py Stage 9) ────────────────────────────
-WATCH_THRESHOLD  = 4
+WATCH_THRESHOLD  = 3
 ATR_PERIOD       = 14
 ATR_MULTIPLIER   = 2.0
 MAX_POSITION_PCT = 0.20
@@ -259,7 +259,7 @@ def run_backtest(
     risk_percent: float = 2.0,
     risk_reward: float = 2.0,
     hold_days: int = 10,
-    quality_threshold: int = 60,
+    quality_threshold: int = 50,
     watch_threshold: int = WATCH_THRESHOLD,
     check_earnings: bool = True,
 ) -> dict:
@@ -509,7 +509,7 @@ def run_backtest(
 def run_multi_backtest(
     tickers: list,
     initial_capital: float = 1000,
-    quality_threshold: int = 60,
+    quality_threshold: int = 50,
     hold_days: int = 10,
 ) -> pd.DataFrame:
     """

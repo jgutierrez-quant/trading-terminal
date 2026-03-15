@@ -35,7 +35,7 @@ NEUTRAL = "#888888"
 BG      = "#0e1117"
 BG2     = "#1a1d24"
 
-WATCH_THRESHOLD = 4   # must match anomaly_detector.py Stage 9
+WATCH_THRESHOLD = 3   # must match anomaly_detector.py (Stage 9c)
 
 
 # ── Public entry point ────────────────────────────────────────────────────────

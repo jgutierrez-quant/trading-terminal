@@ -1,8 +1,8 @@
 """
 Anomaly detector — combines technical signals + sentiment scores to score tickers.
 
-A ticker is flagged as 'Watch' when 4+ signals align AND the signal direction
-agrees with the 50-day MA trend (Stage 9: raised from 3, direction filter added).
+A ticker is flagged as 'Watch' when 3+ signals align AND one direction
+strictly outnumbers the other (Stage 9c: threshold back to 3, direction logic preserved).
 
 Public API:
     compute_anomaly(ticker, tech_dict, sentiment_dict,
@@ -30,7 +30,7 @@ import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
-WATCH_THRESHOLD = 4   # raised from 3 — higher conviction setups only
+WATCH_THRESHOLD = 3   # 3 aligned signals required (Stage 9c: direction logic preserved)
 
 # ── Sector ETF mapping (mirrors sector_monitor.py SECTOR_ETFS) ─────────────────
 _SECTOR_ETF = {
