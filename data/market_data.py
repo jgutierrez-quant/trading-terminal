@@ -5,8 +5,11 @@ Returns a single clean dict for any ticker.
 
 Price priority:
     1. Alpaca IEX real-time mid (bid+ask)/2  — free, real-time via IEX feed
-    2. Polygon last_price / day_close        — free tier: previous-day data only
-    3. yfinance current_price               — 15-min delayed fallback
+    2. yfinance current_price               — 15-min delayed fallback
+
+Polygon is used ONLY for historical OHLCV bar data and options chains.
+On the free Polygon tier, quote endpoints return previous-day data only,
+so Polygon is intentionally excluded from the live price chain.
 """
 
 import logging
@@ -20,12 +23,13 @@ logger = logging.getLogger(__name__)
 
 def get_ticker_data(ticker: str) -> dict:
     """
-    Pull all available data for a ticker from all three sources.
+    Pull all available data for a ticker from all sources.
 
-    Price priority: Alpaca IEX real-time → Polygon → yfinance (15-min delayed).
+    Price priority: Alpaca IEX real-time → yfinance (15-min delayed).
+    Polygon is NOT used for live prices — only for intraday bars and options.
     Each sub-call is wrapped independently so partial failures degrade gracefully.
 
-    Returns `price_source` key: "alpaca" | "polygon" | "yfinance" | None
+    Returns `price_source`: 'Alpaca Live' | 'yfinance Delayed' | 'Polygon' | None
     """
     ticker = ticker.upper().strip()
     logger.info("Fetching full market data for %s", ticker)
@@ -39,36 +43,35 @@ def get_ticker_data(ticker: str) -> dict:
     fundamentals   = _safe(get_fundamentals,     ticker)
     earnings       = _safe(get_earnings_dates,   ticker, default=[])
 
-    # --- Resolve best live price (Alpaca IEX → Polygon → yfinance) ---
+    # --- Resolve best live price: Alpaca IEX → yfinance ---
+    # Polygon intentionally excluded from price chain (free tier = EOD only)
     alpaca_mid = alpaca_quote.get("mid") if not alpaca_quote.get("error") else None
-    poly_price = (polygon_quote.get("last_price") or polygon_quote.get("day_close")
-                  if not polygon_quote.get("error") else None)
     yf_current = yf_price.get("current_price") if not yf_price.get("error") else None
 
     if alpaca_mid:
         live_price   = alpaca_mid
-        price_source = "alpaca"
-    elif poly_price:
-        live_price   = poly_price
-        price_source = "polygon"
+        price_source = "Alpaca Live"
     elif yf_current:
         live_price   = yf_current
-        price_source = "yfinance"
+        price_source = "yfinance Delayed"
     else:
-        live_price   = None
-        price_source = None
+        # Last resort: Polygon EOD close (only if both primary sources fail)
+        poly_close = (polygon_quote.get("last_price") or polygon_quote.get("day_close")
+                      if not polygon_quote.get("error") else None)
+        live_price   = poly_close
+        price_source = "Polygon" if poly_close else None
 
-    # --- Resolve best change % (Polygon → yfinance) ---
+    # --- Resolve best change % (yfinance preferred; Polygon as backup) ---
     change_pct = (
-        polygon_quote.get("change_pct")
-        or yf_price.get("change_pct")
+        yf_price.get("change_pct")
+        or polygon_quote.get("change_pct")
     )
 
     return {
         "ticker":        ticker,
         "live_price":    live_price,
         "change_pct":    change_pct,
-        "price_source":  price_source,   # "alpaca" | "polygon" | "yfinance" | None
+        "price_source":  price_source,   # 'Alpaca Live' | 'yfinance Delayed' | 'Polygon' | None
         # Granular sub-payloads for dashboard use
         "alpaca_quote":  alpaca_quote,
         "quote":         polygon_quote,
@@ -77,11 +80,11 @@ def get_ticker_data(ticker: str) -> dict:
         "earnings":      earnings,
         "intraday_bars": intraday_bars,
         "options_chain": options_chain,
-        # Quick health check — useful for the test script and dashboard
+        # Quick health check
         "sources": {
             "alpaca_quote_ok":     not alpaca_quote.get("error"),
-            "polygon_quote_ok":    "error" not in polygon_quote,
-            "yfinance_ok":         "error" not in yf_price,
+            "polygon_quote_ok":    not polygon_quote.get("error"),
+            "yfinance_ok":         not yf_price.get("error"),
             "intraday_bars_count": len(intraday_bars) if isinstance(intraday_bars, list) else 0,
             "options_count":       len(options_chain) if isinstance(options_chain, list) else 0,
         },

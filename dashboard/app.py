@@ -816,16 +816,16 @@ def _render_market_tab(selected: str):
     chg_c     = _chg_color(change_pct)
     sub_str   = " — ".join(filter(None, [short_name, sector, industry]))
 
-    # Data source badge
-    if price_source == "alpaca":
+    # Data source badge — labels match price_source values in market_data.py
+    if price_source == "Alpaca Live":
         src_label = "Alpaca Live"
         src_color = GREEN
-    elif price_source == "polygon":
-        src_label = "Polygon EOD"
-        src_color = YELLOW
-    elif price_source == "yfinance":
+    elif price_source == "yfinance Delayed":
         src_label = "yfinance Delayed"
-        src_color = NEUTRAL
+        src_color = YELLOW
+    elif price_source == "Polygon":
+        src_label = "Polygon"
+        src_color = BLUE
     else:
         src_label = "No Price"
         src_color = RED
@@ -1858,11 +1858,30 @@ def render():
         )
 
         for wl_t in sorted_watchlist:
-            wl_md    = cached_market_data(wl_t)
-            wl_price = wl_md.get("live_price")
-            wl_chg   = wl_md.get("change_pct")
+            wl_md     = cached_market_data(wl_t)
+            wl_price  = wl_md.get("live_price")
+            wl_chg    = wl_md.get("change_pct")
+            wl_src    = wl_md.get("price_source")   # 'Alpaca Live' | 'yfinance Delayed' | 'Polygon'
             price_str = _fmt_price(wl_price)
             chg_str   = _fmt_pct(wl_chg)
+
+            # Source dot: green = Alpaca Live, yellow = yfinance Delayed, blue = Polygon
+            if wl_src == "Alpaca Live":
+                src_dot   = "●"
+                src_dot_c = GREEN
+                src_tip   = "Alpaca Live"
+            elif wl_src == "yfinance Delayed":
+                src_dot   = "●"
+                src_dot_c = YELLOW
+                src_tip   = "yfinance Delayed"
+            elif wl_src == "Polygon":
+                src_dot   = "●"
+                src_dot_c = BLUE
+                src_tip   = "Polygon EOD"
+            else:
+                src_dot   = "○"
+                src_dot_c = NEUTRAL
+                src_tip   = "No price"
 
             yf_sent    = cached_yahoo_fast(wl_t)
             fast_label = _quick_sentiment_label(yf_sent.get("score"))
@@ -1878,7 +1897,8 @@ def render():
             with col_btn:
                 prefix   = "> " if wl_t == selected else "  "
                 btn_text = f"{prefix}{wl_t}{fire}  {price_str}  {chg_str}"
-                if st.button(btn_text, key=f"wl_{wl_t}", width="stretch"):
+                if st.button(btn_text, key=f"wl_{wl_t}", width="stretch",
+                             help=f"Price source: {src_tip}"):
                     st.session_state.selected_ticker = wl_t
                     st.rerun()
             with col_x:
@@ -1890,6 +1910,9 @@ def render():
 
             q_score = an.get("quality_score", 0)
             badge_html = (
+                f'<span style="color:{src_dot_c};font-size:0.6rem" title="{src_tip}">{src_dot}</span>'
+                f'<span style="color:{NEUTRAL};font-size:0.62rem;margin-left:3px">{wl_src or "—"}</span>'
+                f'&nbsp;&nbsp;'
                 f'<span style="color:{label_c};font-size:0.72rem">{fast_label}</span>'
                 f'<span style="color:{NEUTRAL};font-size:0.68rem;margin-left:6px">'
                 f'[{a_score} sig] [Q:{q_score}]</span>'
