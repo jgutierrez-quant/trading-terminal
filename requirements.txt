@@ -1,0 +1,10 @@
+yfinance
+polygon-api-client
+requests
+python-dotenv
+streamlit
+plotly
+pandas
+apscheduler
+vaderSentiment
+pytrends
