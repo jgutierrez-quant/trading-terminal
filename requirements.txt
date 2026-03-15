@@ -8,3 +8,6 @@ pandas
 apscheduler
 vaderSentiment
 pytrends
+beautifulsoup4
+lxml
+praw
