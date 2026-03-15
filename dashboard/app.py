@@ -917,7 +917,7 @@ def _render_market_tab(selected: str):
 
     if an_data.get("is_watch"):
         direction  = an_data.get("direction", "")
-        dir_color  = GREEN if direction == "Long" else RED
+        dir_color  = GREEN if direction == "Long" else (RED if direction == "Short" else NEUTRAL)
         dir_badge  = (
             f'<span style="background:{dir_color}22;border:1px solid {dir_color};'
             f'border-radius:3px;padding:1px 7px;font-size:0.78rem;'
@@ -1718,7 +1718,7 @@ def render():
             )
             if is_watch and reason:
                 direction  = an.get("direction", "")
-                dir_color  = GREEN if direction == "Long" else RED
+                dir_color  = GREEN if direction == "Long" else (RED if direction == "Short" else NEUTRAL)
                 dir_txt    = (f'<span style="color:{dir_color};font-size:0.65rem">'
                               f'{direction}</span> ' if direction else "")
                 badge_html += (
@@ -1726,6 +1726,28 @@ def render():
                     f'{reason[:50]}{"..." if len(reason)>50 else ""}</span>'
                 )
             st.markdown(badge_html, unsafe_allow_html=True)
+
+        # ── Add ticker to watchlist ───────────────────────────────────────────
+        st.divider()
+        st.markdown(
+            f'<span style="color:{NEUTRAL};font-size:0.75rem;font-weight:bold">'
+            f'ADD TICKER TO WATCHLIST</span>',
+            unsafe_allow_html=True,
+        )
+        _add1, _add2 = st.columns([3, 1])
+        with _add1:
+            new_ticker = st.text_input(
+                "add_ticker_sidebar", label_visibility="collapsed",
+                placeholder="e.g. MSFT, AMD",
+                key="ticker_input_box",
+            )
+        with _add2:
+            if st.button("Add", key="add_ticker_btn", width="stretch"):
+                t = (new_ticker or "").strip().upper()
+                if t:
+                    add_ticker(t)
+                    st.session_state.selected_ticker = t
+                    st.rerun()
 
         st.divider()
         remaining_secs = max(0, int(st.session_state.next_refresh - time.time()))
@@ -1736,29 +1758,12 @@ def render():
             st.rerun()
 
     # ── TOP BAR ───────────────────────────────────────────────────────────────
-    col_title, col_input = st.columns([3, 5])
-    with col_title:
-        st.markdown(
-            f'<span style="font-size:1.3rem;font-weight:bold;color:{GREEN}">TRADING TERMINAL</span>'
-            f'<br><span style="font-size:0.8rem;color:{NEUTRAL}">'
-            f'{datetime.now().strftime("%A, %B %d %Y  %H:%M:%S")}</span>',
-            unsafe_allow_html=True,
-        )
-    with col_input:
-        col_box, col_add = st.columns([4, 1])
-        with col_box:
-            new_ticker = st.text_input(
-                "ticker_add", label_visibility="collapsed",
-                placeholder="Add ticker... (e.g. MSFT, AMD, GLD)",
-                key="ticker_input_box",
-            )
-        with col_add:
-            if st.button("+ Add", width="stretch"):
-                t = (new_ticker or "").strip().upper()
-                if t:
-                    add_ticker(t)
-                    st.session_state.selected_ticker = t
-                    st.rerun()
+    st.markdown(
+        f'<span style="font-size:1.3rem;font-weight:bold;color:{GREEN}">TRADING TERMINAL</span>'
+        f'<br><span style="font-size:0.8rem;color:{NEUTRAL}">'
+        f'{datetime.now().strftime("%A, %B %d %Y  %H:%M:%S")}</span>',
+        unsafe_allow_html=True,
+    )
 
     # ── MACRO ROW ─────────────────────────────────────────────────────────────
     macro_items = cached_macro()

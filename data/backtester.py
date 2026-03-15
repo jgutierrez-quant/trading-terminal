@@ -186,31 +186,28 @@ def generate_signals(df: pd.DataFrame, watch_threshold: int = WATCH_THRESHOLD) -
         ((df['price_vs_sma20'] == 'Below') & (df['price_vs_sma50'] == 'Below')).astype(int)
     )
 
-    # ── Quality score (0-100) ─────────────────────────────────────────────────
+    # ── Quality score (0-100) — rewards aligned directional signals ──────────
     dir_total  = bull_ct + bear_ct
     dominant   = np.maximum(bull_ct, bear_ct)
-    alignment  = np.where(dir_total > 0, dominant / dir_total.replace(0, 1), 0.5)
+    alignment  = np.where(dir_total > 0, dominant / dir_total.replace(0, 1), 0.0)
     vol_pts    = np.where(df['vol_signal'] == 'High Volume', 20,
                  np.where(df['vol_signal'] == 'Elevated', 10, 0))
     df['quality_score'] = (
-        np.minimum(df['signal_count'] / 6.0, 1.0) * 40 +
+        np.minimum(dominant / 5.0, 1.0) * 40 +   # directional count (5 max)
         alignment * 40 +
         vol_pts
     ).round().astype(int)
 
-    # ── Direction with SMA50 filter ───────────────────────────────────────────
-    above_sma50 = close > df['sma50']
-    # Long: bullish dominates (or tied) AND price above SMA50
-    is_long  = (bull_ct >= bear_ct) & above_sma50
-    # Short: bearish dominates AND price below SMA50
-    is_short = (bear_ct > bull_ct) & ~above_sma50
-    direction_ok = is_long | is_short
+    # ── Direction — signal dominance only, no SMA50 filter ───────────────────
+    # Long:  total signals >= threshold AND bullish outnumber bearish
+    is_long  = (df['signal_count'] >= watch_threshold) & (bull_ct > bear_ct)
+    # Short: total signals >= threshold AND bearish outnumber bullish
+    is_short = (df['signal_count'] >= watch_threshold) & (bear_ct > bull_ct)
 
-    df['direction'] = np.where(is_long,  'Bullish',
-                      np.where(is_short, 'Bearish', 'Filtered'))
+    df['direction'] = np.where(bull_ct > bear_ct, 'Bullish',
+                      np.where(bear_ct > bull_ct, 'Bearish', 'Neutral'))
 
-    # watch_flag requires threshold AND direction alignment with trend
-    df['watch_flag'] = (df['signal_count'] >= watch_threshold) & direction_ok
+    df['watch_flag'] = is_long | is_short
 
     # ── Signal list (string per row) ──────────────────────────────────────────
     def _signal_list(row):

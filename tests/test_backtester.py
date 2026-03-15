@@ -103,7 +103,7 @@ def test_generate_signals():
     assert (df['signal_count'] >= 0).all(), "signal_count must be >= 0"
     assert (df['quality_score'] >= 0).all(), "quality_score must be >= 0"
     assert (df['quality_score'] <= 100).all(), "quality_score must be <= 100"
-    valid_dirs = {'Bullish', 'Bearish', 'Filtered'}
+    valid_dirs = {'Bullish', 'Bearish', 'Neutral'}
     bad_dirs   = set(df['direction'].unique()) - valid_dirs
     assert not bad_dirs, f"Unexpected direction values: {bad_dirs}"
 

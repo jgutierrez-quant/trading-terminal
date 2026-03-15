@@ -136,24 +136,20 @@ def compute_anomaly(
     bull_count = sum(1 for s in signals if s in _BULLISH)
     bear_count = sum(1 for s in signals if s in _BEARISH)
 
-    # Tiebreaker: use SMA50 trend position
     if bull_count > bear_count:
         direction = "Long"
     elif bear_count > bull_count:
         direction = "Short"
     else:
-        direction = "Long" if sma50 == "Above" else "Short"
+        direction = "Neutral"   # tied — neither side triggers a Watch
 
-    # ── Quality score (0-100) — computed on core signals before sector check ──
+    # ── Quality score (0-100) — rewards aligned directional signals ──────────
     total_directional = bull_count + bear_count
-    if total_directional > 0:
-        dominant = bull_count if direction == "Long" else bear_count
-        alignment = dominant / total_directional
-    else:
-        alignment = 0.5
+    dominant  = max(bull_count, bear_count)
+    alignment = dominant / total_directional if total_directional > 0 else 0.0
 
-    vol_pts = 20 if vol_sig == "High Volume" else (10 if vol_sig == "Elevated" else 0)
-    sig_ct_score = min(len(signals) / 6.0, 1.0) * 40
+    vol_pts      = 20 if vol_sig == "High Volume" else (10 if vol_sig == "Elevated" else 0)
+    sig_ct_score = min(dominant / 5.0, 1.0) * 40   # 5 directional signals max
     quality_score = int(round(sig_ct_score + alignment * 40 + vol_pts))
 
     # ── Sector momentum (optional — adds to score) ────────────────────────────
@@ -166,12 +162,8 @@ def compute_anomaly(
     # ── Final score and Watch flag ────────────────────────────────────────────
     score = len(signals)
 
-    # Direction filter: Long only if price above SMA50; Short only if below
-    dir_ok = (
-        (direction == "Long"  and sma50 == "Above") or
-        (direction == "Short" and sma50 == "Below")
-    )
-    is_watch = score >= WATCH_THRESHOLD and dir_ok
+    # Watch: total signals >= threshold AND one direction strictly outnumbers the other
+    is_watch = score >= WATCH_THRESHOLD and (bull_count > bear_count or bear_count > bull_count)
 
     reason = " + ".join(signals[:5]) if signals else "No notable signals"
 
