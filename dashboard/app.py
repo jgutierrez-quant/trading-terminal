@@ -27,13 +27,13 @@ load_dotenv(os.path.join(_ROOT, ".env"))
 # Apply urllib3 v2 compat patch for pytrends before importing aggregator
 import sentiment.google_trends_client  # noqa: F401
 
-from data.market_data              import get_ticker_data
-from data.technicals               import get_technicals
-from data.anomaly_detector         import compute_anomaly
-from sentiment.sentiment_aggregator import get_sentiment
-from sentiment.yahoo_news_client   import get_news_sentiment as _yahoo_fast
-from utils.watchlist               import load_watchlist, add_ticker, remove_ticker
-from utils.macro_data              import get_macro_data
+from data.market_data               import get_ticker_data
+from data.technicals                import get_technicals
+from data.anomaly_detector          import compute_anomaly
+from sentiment.sentiment_aggregator  import get_sentiment
+from sentiment.yahoo_news_client    import get_news_sentiment as _yahoo_fast
+from utils.watchlist                import load_watchlist, add_ticker, remove_ticker
+from utils.macro_data               import get_macro_data
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -105,7 +105,7 @@ if "next_refresh" not in st.session_state:
     st.session_state.next_refresh = time.time() + 60
 
 
-# ── Cached fetchers ───────────────────────────────────────────────────────────
+# ── Cached fetchers — Market View ─────────────────────────────────────────────
 
 @st.cache_data(ttl=60, show_spinner=False)
 def cached_market_data(ticker: str) -> dict:
@@ -184,6 +184,87 @@ def cached_weekly_bars(ticker: str) -> list:
         return []
 
 
+# ── Cached fetchers — Screener ────────────────────────────────────────────────
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_screener_movers() -> dict:
+    """Single Finviz call for top gainers/losers. TTL=300s."""
+    from data.screener import get_top_movers
+    return get_top_movers(n=20)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_unusual_volume() -> list:
+    """Single Finviz call for unusual volume tickers. TTL=300s."""
+    from data.screener import get_unusual_volume
+    return get_unusual_volume(n=20)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_sector_data() -> list:
+    """11 sector ETFs via single yfinance batch download. TTL=300s."""
+    from data.sector_monitor import get_sector_data
+    return get_sector_data()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_market_scan() -> list:
+    """
+    Anomaly scan across the full S&P 500 universe.
+
+    Reuses cached_screener_movers() and cached_unusual_volume() so Finviz
+    is never called twice within the same TTL window.
+    Uses cached_technicals() + mock-neutral sentiment (no sentiment API calls
+    for 100+ tickers — keeps first-run time manageable).
+    Returns only Watch-flagged tickers, sorted by anomaly score descending.
+    """
+    from data.screener import get_stock_universe
+
+    movers  = cached_screener_movers()
+    unusual = cached_unusual_volume()
+
+    # Price lookup: movers/unusual rows carry price data; base universe tickers
+    # get price from get_technicals() directly (done in the loop below).
+    price_map = {
+        r["ticker"]: {"price": r.get("price"), "change_pct": r.get("change_pct")}
+        for r in (movers.get("gainers", []) + movers.get("losers", []) + unusual)
+    }
+
+    # Build deduplicated universe: mover tickers first (most likely to be interesting),
+    # then unusual volume, then broad S&P 500 base — capped at 75 tickers.
+    mover_tickers   = [r["ticker"] for r in (movers.get("gainers", []) + movers.get("losers", []))]
+    unusual_tickers = [r["ticker"] for r in unusual]
+    seen: set = set()
+    universe: list = []
+    for t in mover_tickers + unusual_tickers + get_stock_universe():
+        if t not in seen:
+            seen.add(t)
+            universe.append(t)
+        if len(universe) >= 75:
+            break
+
+    mock_sent = {"sentiment_label": "Neutral", "overall_sentiment": 0.0}
+    results = []
+    for ticker in universe:
+        try:
+            tech = cached_technicals(ticker)   # uses Streamlit cache
+            if tech.get("error"):
+                continue
+            anomaly = compute_anomaly(ticker, tech, mock_sent)
+            if not anomaly.get("is_watch"):
+                continue
+            pi = price_map.get(ticker, {})
+            row = dict(anomaly)
+            row["price"]      = pi.get("price") or tech.get("current_price")
+            row["change_pct"] = pi.get("change_pct")
+            results.append(row)
+        except Exception:
+            continue
+
+    results.sort(key=lambda r: r["score"], reverse=True)
+    return results
+
+
 # ── Formatting helpers ────────────────────────────────────────────────────────
 
 def _fmt_price(val) -> str:
@@ -210,6 +291,17 @@ def _fmt_float(val, decimals: int = 2, suffix: str = "") -> str:
     if val is None:
         return "N/A"
     return str(round(val, decimals)) + suffix
+
+def _fmt_volume(val) -> str:
+    if val is None:
+        return "N/A"
+    if val >= 1_000_000_000:
+        return f"{val/1_000_000_000:.1f}B"
+    if val >= 1_000_000:
+        return f"{val/1_000_000:.1f}M"
+    if val >= 1_000:
+        return f"{val/1_000:.0f}K"
+    return str(val)
 
 def _score_color(score) -> str:
     if score is None:
@@ -274,11 +366,41 @@ def _signal_badge(label: str, value_str: str, color: str) -> str:
         f'</div>'
     )
 
+def _movers_table_html(rows: list, accent: str) -> str:
+    """Pure-HTML table for gainers/losers — no interactive elements needed."""
+    html = (
+        '<table style="width:100%;border-collapse:collapse;'
+        'font-size:0.8rem;font-family:monospace">'
+        '<tr style="color:#666;border-bottom:1px solid #2a2d35">'
+        '<th style="text-align:left;padding:4px 8px">Ticker</th>'
+        '<th style="text-align:right;padding:4px 8px">Price</th>'
+        '<th style="text-align:right;padding:4px 8px">Chg%</th>'
+        '<th style="text-align:right;padding:4px 8px">Vol</th>'
+        '</tr>'
+    )
+    for row in rows:
+        chg       = row.get("change_pct")
+        chg_c     = GREEN if (chg or 0) >= 0 else RED
+        chg_str   = f"{chg:+.2f}%" if chg is not None else "N/A"
+        price_str = f'${row["price"]:.2f}' if row.get("price") else "N/A"
+        vol_str   = _fmt_volume(row.get("volume"))
+        html += (
+            f'<tr style="border-bottom:1px solid #1e2128">'
+            f'<td style="padding:4px 8px;color:{accent};font-weight:bold">'
+            f'{row["ticker"]}</td>'
+            f'<td style="padding:4px 8px;text-align:right">{price_str}</td>'
+            f'<td style="padding:4px 8px;text-align:right;color:{chg_c}">{chg_str}</td>'
+            f'<td style="padding:4px 8px;text-align:right;color:{NEUTRAL}">{vol_str}</td>'
+            f'</tr>'
+        )
+    html += '</table>'
+    return html
+
 
 # ── Chart builders ────────────────────────────────────────────────────────────
 
 def _build_intraday_chart(bars: list, title: str) -> go.Figure:
-    """Intraday 1-min candlestick + volume (existing chart, unchanged)."""
+    """Intraday 1-min candlestick + volume."""
     if not bars:
         fig = go.Figure()
         fig.update_layout(title="No intraday data available",
@@ -334,7 +456,7 @@ def _build_daily_ta_chart(tech: dict, ticker: str) -> go.Figure:
       Row 2 (15%): Volume bars
       Row 3 (25%): MACD line + Signal line + Histogram
     """
-    bars     = tech.get("daily_bars", [])
+    bars      = tech.get("daily_bars", [])
     sr_levels = tech.get("support_resistance", [])
 
     if not bars:
@@ -344,21 +466,20 @@ def _build_daily_ta_chart(tech: dict, ticker: str) -> go.Figure:
                           font=dict(color="#fafafa"), height=520)
         return fig
 
-    # Extract series from bar list
-    dates  = [b["date"]         for b in bars]
-    opens  = [b.get("open")     for b in bars]
-    highs  = [b.get("high")     for b in bars]
-    lows   = [b.get("low")      for b in bars]
-    closes = [b.get("close")    for b in bars]
+    dates  = [b["date"]          for b in bars]
+    opens  = [b.get("open")      for b in bars]
+    highs  = [b.get("high")      for b in bars]
+    lows   = [b.get("low")       for b in bars]
+    closes = [b.get("close")     for b in bars]
     vols   = [b.get("volume", 0) or 0 for b in bars]
-    sma20s = [b.get("sma20")    for b in bars]
-    sma50s = [b.get("sma50")    for b in bars]
-    bb_ups = [b.get("bb_upper") for b in bars]
+    sma20s = [b.get("sma20")     for b in bars]
+    sma50s = [b.get("sma50")     for b in bars]
+    bb_ups = [b.get("bb_upper")  for b in bars]
     bb_mds = [b.get("bb_middle") for b in bars]
-    bb_lws = [b.get("bb_lower") for b in bars]
-    macds  = [b.get("macd")       for b in bars]
-    msigs  = [b.get("macd_signal") for b in bars]
-    mhists = [b.get("macd_hist")   for b in bars]
+    bb_lws = [b.get("bb_lower")  for b in bars]
+    macds  = [b.get("macd")         for b in bars]
+    msigs  = [b.get("macd_signal")  for b in bars]
+    mhists = [b.get("macd_hist")    for b in bars]
 
     vol_colors  = [GREEN if c is not None and o is not None and c >= o else RED
                    for c, o in zip(closes, opens)]
@@ -370,7 +491,7 @@ def _build_daily_ta_chart(tech: dict, ticker: str) -> go.Figure:
         vertical_spacing=0.02,
     )
 
-    # ── Row 1: Candlestick ────────────────────────────────────────────────────
+    # Row 1: Candlestick
     fig.add_trace(go.Candlestick(
         x=dates, open=opens, high=highs, low=lows, close=closes,
         name="Price",
@@ -378,7 +499,7 @@ def _build_daily_ta_chart(tech: dict, ticker: str) -> go.Figure:
         showlegend=False,
     ), row=1, col=1)
 
-    # Bollinger Bands — upper first so fill='tonexty' fills down to lower
+    # Bollinger Bands
     fig.add_trace(go.Scatter(
         x=dates, y=bb_ups, name="BB Upper",
         line=dict(color="#666688", width=0.7, dash="dot"),
@@ -401,7 +522,7 @@ def _build_daily_ta_chart(tech: dict, ticker: str) -> go.Figure:
         line=dict(color=BLUE, width=1.3), showlegend=True,
     ), row=1, col=1)
 
-    # Support / Resistance — horizontal dashed lines with price labels
+    # Support / Resistance horizontal dashed lines
     for sr in sr_levels:
         fig.add_hline(
             y=sr, row=1, col=1,
@@ -411,13 +532,13 @@ def _build_daily_ta_chart(tech: dict, ticker: str) -> go.Figure:
             annotation_font=dict(size=9, color="#aaaaaa"),
         )
 
-    # ── Row 2: Volume ─────────────────────────────────────────────────────────
+    # Row 2: Volume
     fig.add_trace(go.Bar(
         x=dates, y=vols, name="Volume",
         marker_color=vol_colors, opacity=0.5, showlegend=False,
     ), row=2, col=1)
 
-    # ── Row 3: MACD ───────────────────────────────────────────────────────────
+    # Row 3: MACD
     fig.add_trace(go.Scatter(
         x=dates, y=macds, name="MACD",
         line=dict(color=GREEN, width=1.3), showlegend=True,
@@ -449,7 +570,6 @@ def _build_daily_ta_chart(tech: dict, ticker: str) -> go.Figure:
     fig.update_yaxes(gridcolor="#2a2d35", showgrid=True)
     fig.update_yaxes(side="right", row=1, col=1)
     fig.update_yaxes(showticklabels=False, showgrid=False, row=2, col=1)
-    # MACD panel y-axis label
     fig.update_yaxes(title_text="MACD", title_font=dict(size=9),
                      side="right", row=3, col=1)
     return fig
@@ -528,130 +648,92 @@ def _build_gauge(score, label: str) -> go.Figure:
     return fig
 
 
-# ── Main render ───────────────────────────────────────────────────────────────
-
-def render():
-    selected = st.session_state.selected_ticker
-
-    # ── SIDEBAR ───────────────────────────────────────────────────────────────
-    with st.sidebar:
-        st.markdown(
-            f'<p style="color:{GREEN};font-size:1.1rem;font-weight:bold;margin-bottom:4px">'
-            f'TRADING TERMINAL</p>',
-            unsafe_allow_html=True,
+def _build_sector_heatmap(sectors: list) -> go.Figure:
+    """
+    Horizontal bar chart showing today's % change for all 11 sector ETFs.
+    Bars are green (positive) or red (negative).
+    The top 2 and bottom 2 sectors are labeled HOT / COLD.
+    """
+    if not sectors:
+        fig = go.Figure()
+        fig.update_layout(
+            title="No sector data available",
+            paper_bgcolor=BG, plot_bgcolor=BG2,
+            font=dict(color="#fafafa"), height=300,
         )
-        st.caption(datetime.now().strftime("%a %b %d, %Y  %H:%M:%S"))
-        st.divider()
+        return fig
 
-        watchlist = load_watchlist()
-        st.markdown("**Watchlist** — sorted by anomaly score")
+    # Already sorted best→worst by get_sector_data(); keep that order for the chart
+    sorted_s = list(sectors)
+    names    = [f'{s["name"]} ({s["ticker"]})' for s in sorted_s]
+    values   = [s["change_pct"] or 0            for s in sorted_s]
+    colors   = [GREEN if v >= 0 else RED         for v in values]
+    text     = [f"{v:+.2f}%" if v != 0 else "N/A" for v in values]
 
-        # Gather anomaly scores for all tickers to enable sort
-        anomaly_map = {}
-        for wl_t in watchlist:
-            try:
-                anomaly_map[wl_t] = cached_anomaly(wl_t)
-            except Exception:
-                anomaly_map[wl_t] = {"score": 0, "is_watch": False, "reason": ""}
+    # Determine HOT / COLD labels (top 2 / bottom 2 valid sectors)
+    valid = [s for s in sorted_s if s["change_pct"] is not None]
+    hot_tickers  = {s["ticker"] for s in valid[:2]}
+    cold_tickers = {s["ticker"] for s in valid[-2:]}
 
-        # Sort descending by score (most interesting at top)
-        sorted_watchlist = sorted(
-            watchlist,
-            key=lambda t: anomaly_map.get(t, {}).get("score", 0),
-            reverse=True,
+    customdata = []
+    for s in sorted_s:
+        if s["ticker"] in hot_tickers:
+            customdata.append("HOT")
+        elif s["ticker"] in cold_tickers:
+            customdata.append("COLD")
+        else:
+            customdata.append("")
+
+    fig = go.Figure(go.Bar(
+        x=values,
+        y=names,
+        orientation="h",
+        marker_color=colors,
+        text=text,
+        textposition="outside",
+        textfont=dict(size=10, color="#cccccc"),
+        hovertemplate="%{y}: %{x:+.2f}%<extra></extra>",
+        customdata=customdata,
+    ))
+
+    # Annotate HOT / COLD labels inside bars
+    for i, (s, label) in enumerate(zip(sorted_s, customdata)):
+        if not label:
+            continue
+        emoji = "🔥" if label == "HOT" else "❄️"
+        fig.add_annotation(
+            x=0,
+            y=names[i],
+            text=f" {emoji} {label}",
+            showarrow=False,
+            font=dict(size=11, color=YELLOW if label == "HOT" else BLUE),
+            xanchor="left",
+            xref="paper",
         )
 
-        for wl_t in sorted_watchlist:
-            wl_md  = cached_market_data(wl_t)
-            wl_price = wl_md.get("live_price")
-            wl_chg   = wl_md.get("change_pct")
-            price_str = _fmt_price(wl_price)
-            chg_str   = _fmt_pct(wl_chg)
+    fig.update_layout(
+        title=dict(text="S&P 500 Sector Performance — Today",
+                   font=dict(color=NEUTRAL, size=13)),
+        paper_bgcolor=BG,
+        plot_bgcolor=BG2,
+        font=dict(color="#fafafa"),
+        height=380,
+        margin=dict(l=0, r=90, t=50, b=10),
+        xaxis=dict(
+            zeroline=True, zerolinecolor="#555", zerolinewidth=1,
+            ticksuffix="%", gridcolor="#2a2d35",
+        ),
+        yaxis=dict(gridcolor="#2a2d35", tickfont=dict(size=10)),
+        showlegend=False,
+    )
+    return fig
 
-            yf_sent    = cached_yahoo_fast(wl_t)
-            fast_label = _quick_sentiment_label(yf_sent.get("score"))
-            label_c    = _label_color(fast_label)
 
-            an       = anomaly_map.get(wl_t, {})
-            is_watch = an.get("is_watch", False)
-            a_score  = an.get("score", 0)
-            reason   = an.get("reason", "")
+# ── Market View tab content ────────────────────────────────────────────────────
 
-            # Watch flag icon
-            fire = " 🔥" if is_watch else ""
+def _render_market_tab(selected: str):
+    """Render the full per-ticker market view panel."""
 
-            col_btn, col_x = st.columns([5, 1])
-            with col_btn:
-                prefix   = "> " if wl_t == selected else "  "
-                btn_text = f"{prefix}{wl_t}{fire}  {price_str}  {chg_str}"
-                if st.button(btn_text, key=f"wl_{wl_t}", width="stretch"):
-                    st.session_state.selected_ticker = wl_t
-                    st.rerun()
-            with col_x:
-                if st.button("×", key=f"rm_{wl_t}", help=f"Remove {wl_t}"):
-                    remaining = remove_ticker(wl_t)
-                    if st.session_state.selected_ticker == wl_t:
-                        st.session_state.selected_ticker = remaining[0] if remaining else "AAPL"
-                    st.rerun()
-
-            # Sentiment badge + anomaly score
-            badge_html = (
-                f'<span style="color:{label_c};font-size:0.72rem">{fast_label}</span>'
-                f'<span style="color:{NEUTRAL};font-size:0.68rem;margin-left:6px">'
-                f'[{a_score} sig]</span>'
-            )
-            if is_watch and reason:
-                badge_html += (
-                    f'<br><span style="color:{YELLOW};font-size:0.65rem">'
-                    f'{reason[:50]}{"..." if len(reason)>50 else ""}</span>'
-                )
-            st.markdown(badge_html, unsafe_allow_html=True)
-
-        st.divider()
-        remaining_secs = max(0, int(st.session_state.next_refresh - time.time()))
-        st.caption(f"Auto-refresh in {remaining_secs}s")
-        if st.button("Force Refresh", width="stretch"):
-            st.cache_data.clear()
-            st.session_state.next_refresh = time.time() + 60
-            st.rerun()
-
-    # ── TOP BAR ───────────────────────────────────────────────────────────────
-    col_title, col_input = st.columns([3, 5])
-    with col_title:
-        st.markdown(
-            f'<span style="font-size:1.3rem;font-weight:bold;color:{GREEN}">TRADING TERMINAL</span>'
-            f'<br><span style="font-size:0.8rem;color:{NEUTRAL}">'
-            f'{datetime.now().strftime("%A, %B %d %Y  %H:%M:%S")}</span>',
-            unsafe_allow_html=True,
-        )
-    with col_input:
-        col_box, col_add = st.columns([4, 1])
-        with col_box:
-            new_ticker = st.text_input(
-                "ticker_add", label_visibility="collapsed",
-                placeholder="Add ticker... (e.g. MSFT, AMD, GLD)",
-                key="ticker_input_box",
-            )
-        with col_add:
-            if st.button("+ Add", width="stretch"):
-                t = (new_ticker or "").strip().upper()
-                if t:
-                    add_ticker(t)
-                    st.session_state.selected_ticker = t
-                    st.rerun()
-
-    # ── MACRO ROW ─────────────────────────────────────────────────────────────
-    macro_items = cached_macro()
-    m_cols = st.columns(5)
-    for i, m in enumerate(macro_items[:5]):
-        with m_cols[i]:
-            st.metric(label=m.get("name", ""),
-                      value=m.get("display_value", "N/A"),
-                      delta=m.get("change_display"))
-
-    st.divider()
-
-    # ── LOAD ALL DATA ─────────────────────────────────────────────────────────
     with st.spinner(f"Loading {selected}..."):
         data = cached_market_data(selected)
         sent = cached_sentiment(selected)
@@ -757,7 +839,6 @@ def render():
     # ── TECHNICAL ANALYSIS ────────────────────────────────────────────────────
     st.subheader("Technical Analysis")
 
-    # Signal badges row
     rsi_val  = tech.get("rsi")
     rsi_sig  = tech.get("rsi_signal", "Neutral")
     macd_sig = tech.get("macd_signal", "Neutral")
@@ -767,7 +848,6 @@ def render():
     vol_rat  = tech.get("volume_ratio")
     vwap_val = tech.get("vwap")
 
-    # Pre-compute all display strings
     rsi_display  = f"{_fmt_float(rsi_val, 1)} · {rsi_sig}"
     vwap_display = f"{_fmt_price(vwap_val)} · {vwap_sig}"
     vol_display  = f"{_fmt_float(vol_rat, 2)}x · {vol_sig}"
@@ -787,7 +867,6 @@ def render():
     )
     st.markdown(badges_html, unsafe_allow_html=True)
 
-    # Anomaly reason
     an_data = cached_anomaly(selected)
     if an_data.get("is_watch"):
         st.markdown(
@@ -807,11 +886,11 @@ def render():
     with tab_intra:
         intraday = data.get("intraday_bars") or []
         if len(intraday) >= 10:
-            bars       = intraday
-            chart_ttl  = f"{selected} — 1-Min Intraday (Polygon)"
+            bars      = intraday
+            chart_ttl = f"{selected} — 1-Min Intraday (Polygon)"
         else:
-            bars       = cached_daily_bars(selected)
-            chart_ttl  = f"{selected} — Daily 1-Month (yfinance, intraday unavailable)"
+            bars      = cached_daily_bars(selected)
+            chart_ttl = f"{selected} — Daily 1-Month (yfinance, intraday unavailable)"
         st.plotly_chart(_build_intraday_chart(bars, chart_ttl),
                         width="stretch",
                         config={"displayModeBar": False})
@@ -821,8 +900,7 @@ def render():
                         width="stretch",
                         config={"displayModeBar": False})
 
-        # S/R level table below chart
-        sr = tech.get("support_resistance", [])
+        sr    = tech.get("support_resistance", [])
         cur_p = tech.get("current_price") or live_price
         if sr and cur_p:
             st.markdown(
@@ -832,8 +910,8 @@ def render():
             )
             sr_html = '<div style="display:flex;gap:10px;margin-top:6px">'
             for lv in sr:
-                dist = round((cur_p - lv) / cur_p * 100, 1)
-                sign = "+" if dist >= 0 else ""
+                dist   = round((cur_p - lv) / cur_p * 100, 1)
+                sign   = "+" if dist >= 0 else ""
                 dist_c = GREEN if dist >= 0 else RED
                 sr_html += (
                     f'<div style="background:{BG2};border:1px solid #333;'
@@ -922,7 +1000,316 @@ def render():
                     unsafe_allow_html=True,
                 )
 
-    # ── AUTO-REFRESH ──────────────────────────────────────────────────────────
+
+# ── Screener tab content ──────────────────────────────────────────────────────
+
+def _render_screener_tab():
+    """Render the Market Screener panel."""
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    hdr_col, btn_col = st.columns([6, 1])
+    with hdr_col:
+        st.markdown(
+            f'<span style="font-size:1.1rem;font-weight:bold;color:{GREEN}">'
+            f'MARKET SCREENER</span>'
+            f'&nbsp;&nbsp;<span style="color:{NEUTRAL};font-size:0.78rem">'
+            f'Data cached · refreshes every 5 min'
+            f'&nbsp;|&nbsp;{datetime.now().strftime("%H:%M:%S")}</span>',
+            unsafe_allow_html=True,
+        )
+    with btn_col:
+        if st.button("Force Refresh", key="screener_force_refresh", width="stretch"):
+            cached_screener_movers.clear()
+            cached_unusual_volume.clear()
+            cached_sector_data.clear()
+            cached_market_scan.clear()
+            st.rerun()
+
+    # ── TOP MOVERS ────────────────────────────────────────────────────────────
+    st.markdown(
+        f'<span style="color:{NEUTRAL};font-size:0.75rem;font-weight:bold">'
+        f'TODAY\'S TOP MOVERS</span>',
+        unsafe_allow_html=True,
+    )
+
+    with st.spinner("Loading movers..."):
+        movers = cached_screener_movers()
+
+    if movers.get("error"):
+        st.caption(f"Note: {movers['error']}")
+
+    mv_left, mv_right = st.columns(2)
+    with mv_left:
+        st.markdown(
+            f'<span style="color:{GREEN};font-size:0.78rem;font-weight:bold">'
+            f'TOP GAINERS</span>',
+            unsafe_allow_html=True,
+        )
+        gainers = movers.get("gainers", [])
+        if gainers:
+            st.markdown(_movers_table_html(gainers, GREEN), unsafe_allow_html=True)
+        else:
+            st.caption("No data available.")
+
+    with mv_right:
+        st.markdown(
+            f'<span style="color:{RED};font-size:0.78rem;font-weight:bold">'
+            f'TOP LOSERS</span>',
+            unsafe_allow_html=True,
+        )
+        losers = movers.get("losers", [])
+        if losers:
+            st.markdown(_movers_table_html(losers, RED), unsafe_allow_html=True)
+        else:
+            st.caption("No data available.")
+
+    st.divider()
+
+    # ── SECTOR HEATMAP ────────────────────────────────────────────────────────
+    st.markdown(
+        f'<span style="color:{NEUTRAL};font-size:0.75rem;font-weight:bold">'
+        f'SECTOR PERFORMANCE</span>',
+        unsafe_allow_html=True,
+    )
+    with st.spinner("Loading sectors..."):
+        sectors = cached_sector_data()
+    st.plotly_chart(_build_sector_heatmap(sectors), width="stretch",
+                    config={"displayModeBar": False})
+
+    st.divider()
+
+    # ── ANOMALY SCAN ──────────────────────────────────────────────────────────
+    st.markdown(
+        f'<span style="color:{YELLOW};font-size:0.75rem;font-weight:bold">'
+        f'ANOMALY SCAN — TOP SETUPS (technical signals only)</span>',
+        unsafe_allow_html=True,
+    )
+
+    with st.spinner(
+        "Running anomaly scan across 75 stocks "
+        "(first run may take 1–2 min while technicals load)..."
+    ):
+        scan_results = cached_market_scan()
+
+    if not scan_results:
+        st.caption(
+            "No Watch-flagged tickers detected in the current scan universe."
+        )
+    else:
+        watchlist = load_watchlist()
+
+        # Column header strip (HTML — no buttons)
+        st.markdown(
+            '<div style="display:grid;'
+            'grid-template-columns:85px 75px 70px 55px 1fr 88px;'
+            'gap:4px;padding:5px 0 3px 0;'
+            'font-size:0.7rem;color:#555;font-weight:bold;'
+            'border-bottom:1px solid #2a2d35;font-family:monospace">'
+            '<span>TICKER</span>'
+            '<span>PRICE</span>'
+            '<span>CHG%</span>'
+            '<span>SCORE</span>'
+            '<span>SIGNALS / REASON</span>'
+            '<span></span>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        for row in scan_results:
+            ticker   = row["ticker"]
+            score    = row.get("score", 0)
+            reason   = row.get("reason", "—")
+            price    = row.get("price")
+            chg      = row.get("change_pct")
+            in_wl    = ticker in watchlist
+
+            # Row accent colour based on signal bias
+            signals   = row.get("signals", [])
+            bull_n    = sum(1 for s in signals
+                            if any(k in s for k in
+                                   ["Bullish", "Oversold", "Above VWAP", "Above MA", "BB Oversold"]))
+            bear_n    = sum(1 for s in signals
+                            if any(k in s for k in
+                                   ["Bearish", "Overbought", "Below VWAP", "Below MA", "BB Overbought"]))
+            accent    = GREEN if bull_n > bear_n else (RED if bear_n > bull_n else YELLOW)
+            score_c   = GREEN if score >= 5 else (YELLOW if score >= 3 else NEUTRAL)
+            chg_c     = GREEN if (chg or 0) >= 0 else RED
+            price_str = f"${price:.2f}" if price else "N/A"
+            chg_str   = f"{chg:+.2f}%" if chg is not None else "N/A"
+
+            # One st.columns() strip per row — required for st.button in last column
+            c1, c2, c3, c4, c5, c6 = st.columns([1.1, 1, 0.9, 0.7, 4.2, 1.1])
+
+            with c1:
+                fire = " 🔥" if row.get("is_watch") else ""
+                st.markdown(
+                    f'<span style="font-weight:bold;color:{accent};'
+                    f'font-family:monospace;font-size:0.9rem">{ticker}{fire}</span>',
+                    unsafe_allow_html=True,
+                )
+            with c2:
+                st.markdown(
+                    f'<span style="font-size:0.82rem">{price_str}</span>',
+                    unsafe_allow_html=True,
+                )
+            with c3:
+                st.markdown(
+                    f'<span style="color:{chg_c};font-size:0.82rem">{chg_str}</span>',
+                    unsafe_allow_html=True,
+                )
+            with c4:
+                st.markdown(
+                    f'<span style="color:{score_c};font-weight:bold;'
+                    f'font-size:0.9rem">{score}</span>',
+                    unsafe_allow_html=True,
+                )
+            with c5:
+                st.markdown(
+                    f'<span style="color:{NEUTRAL};font-size:0.76rem">'
+                    f'{reason[:80]}{"..." if len(reason) > 80 else ""}</span>',
+                    unsafe_allow_html=True,
+                )
+            with c6:
+                if in_wl:
+                    st.markdown(
+                        f'<span style="color:{NEUTRAL};font-size:0.72rem">In WL ✓</span>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    if st.button("+ Watch", key=f"scan_add_{ticker}"):
+                        add_ticker(ticker)
+                        st.session_state.selected_ticker = ticker
+                        st.rerun()
+
+
+# ── Main render ───────────────────────────────────────────────────────────────
+
+def render():
+    selected = st.session_state.selected_ticker
+
+    # ── SIDEBAR ───────────────────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown(
+            f'<p style="color:{GREEN};font-size:1.1rem;font-weight:bold;margin-bottom:4px">'
+            f'TRADING TERMINAL</p>',
+            unsafe_allow_html=True,
+        )
+        st.caption(datetime.now().strftime("%a %b %d, %Y  %H:%M:%S"))
+        st.divider()
+
+        watchlist = load_watchlist()
+        st.markdown("**Watchlist** — sorted by anomaly score")
+
+        anomaly_map = {}
+        for wl_t in watchlist:
+            try:
+                anomaly_map[wl_t] = cached_anomaly(wl_t)
+            except Exception:
+                anomaly_map[wl_t] = {"score": 0, "is_watch": False, "reason": ""}
+
+        sorted_watchlist = sorted(
+            watchlist,
+            key=lambda t: anomaly_map.get(t, {}).get("score", 0),
+            reverse=True,
+        )
+
+        for wl_t in sorted_watchlist:
+            wl_md    = cached_market_data(wl_t)
+            wl_price = wl_md.get("live_price")
+            wl_chg   = wl_md.get("change_pct")
+            price_str = _fmt_price(wl_price)
+            chg_str   = _fmt_pct(wl_chg)
+
+            yf_sent    = cached_yahoo_fast(wl_t)
+            fast_label = _quick_sentiment_label(yf_sent.get("score"))
+            label_c    = _label_color(fast_label)
+
+            an       = anomaly_map.get(wl_t, {})
+            is_watch = an.get("is_watch", False)
+            a_score  = an.get("score", 0)
+            reason   = an.get("reason", "")
+            fire     = " 🔥" if is_watch else ""
+
+            col_btn, col_x = st.columns([5, 1])
+            with col_btn:
+                prefix   = "> " if wl_t == selected else "  "
+                btn_text = f"{prefix}{wl_t}{fire}  {price_str}  {chg_str}"
+                if st.button(btn_text, key=f"wl_{wl_t}", width="stretch"):
+                    st.session_state.selected_ticker = wl_t
+                    st.rerun()
+            with col_x:
+                if st.button("×", key=f"rm_{wl_t}", help=f"Remove {wl_t}"):
+                    remaining = remove_ticker(wl_t)
+                    if st.session_state.selected_ticker == wl_t:
+                        st.session_state.selected_ticker = remaining[0] if remaining else "AAPL"
+                    st.rerun()
+
+            badge_html = (
+                f'<span style="color:{label_c};font-size:0.72rem">{fast_label}</span>'
+                f'<span style="color:{NEUTRAL};font-size:0.68rem;margin-left:6px">'
+                f'[{a_score} sig]</span>'
+            )
+            if is_watch and reason:
+                badge_html += (
+                    f'<br><span style="color:{YELLOW};font-size:0.65rem">'
+                    f'{reason[:50]}{"..." if len(reason)>50 else ""}</span>'
+                )
+            st.markdown(badge_html, unsafe_allow_html=True)
+
+        st.divider()
+        remaining_secs = max(0, int(st.session_state.next_refresh - time.time()))
+        st.caption(f"Auto-refresh in {remaining_secs}s")
+        if st.button("Force Refresh", width="stretch"):
+            st.cache_data.clear()
+            st.session_state.next_refresh = time.time() + 60
+            st.rerun()
+
+    # ── TOP BAR ───────────────────────────────────────────────────────────────
+    col_title, col_input = st.columns([3, 5])
+    with col_title:
+        st.markdown(
+            f'<span style="font-size:1.3rem;font-weight:bold;color:{GREEN}">TRADING TERMINAL</span>'
+            f'<br><span style="font-size:0.8rem;color:{NEUTRAL}">'
+            f'{datetime.now().strftime("%A, %B %d %Y  %H:%M:%S")}</span>',
+            unsafe_allow_html=True,
+        )
+    with col_input:
+        col_box, col_add = st.columns([4, 1])
+        with col_box:
+            new_ticker = st.text_input(
+                "ticker_add", label_visibility="collapsed",
+                placeholder="Add ticker... (e.g. MSFT, AMD, GLD)",
+                key="ticker_input_box",
+            )
+        with col_add:
+            if st.button("+ Add", width="stretch"):
+                t = (new_ticker or "").strip().upper()
+                if t:
+                    add_ticker(t)
+                    st.session_state.selected_ticker = t
+                    st.rerun()
+
+    # ── MACRO ROW ─────────────────────────────────────────────────────────────
+    macro_items = cached_macro()
+    m_cols = st.columns(5)
+    for i, m in enumerate(macro_items[:5]):
+        with m_cols[i]:
+            st.metric(label=m.get("name", ""),
+                      value=m.get("display_value", "N/A"),
+                      delta=m.get("change_display"))
+
+    st.divider()
+
+    # ── TOP-LEVEL TABS ────────────────────────────────────────────────────────
+    tab_market, tab_screener = st.tabs(["📊 Market View", "🔍 Screener"])
+
+    with tab_market:
+        _render_market_tab(selected)
+
+    with tab_screener:
+        _render_screener_tab()
+
+    # ── AUTO-REFRESH (outside tabs — fires regardless of active tab) ──────────
     if time.time() >= st.session_state.next_refresh:
         st.session_state.next_refresh = time.time() + 60
         st.rerun()
