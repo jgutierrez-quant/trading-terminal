@@ -34,6 +34,12 @@ from sentiment.sentiment_aggregator  import get_sentiment
 from sentiment.yahoo_news_client    import get_news_sentiment as _yahoo_fast
 from utils.watchlist                import load_watchlist, add_ticker, remove_ticker
 from utils.macro_data               import get_macro_data
+from data.alpaca_client             import (get_account, get_positions, get_orders,
+                                            place_order, close_position, cancel_order)
+from utils.risk_manager             import (calculate_position_size, calculate_stop_loss,
+                                            calculate_take_profit, validate_trade,
+                                            get_market_hours)
+from utils.trade_logger             import log_signal, log_trade, get_performance_summary
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -103,6 +109,10 @@ if "selected_ticker" not in st.session_state:
     st.session_state.selected_ticker = "AAPL"
 if "next_refresh" not in st.session_state:
     st.session_state.next_refresh = time.time() + 60
+if "pending_order" not in st.session_state:
+    st.session_state.pending_order = None     # dict when an order is awaiting confirmation
+if "logged_signals_today" not in st.session_state:
+    st.session_state.logged_signals_today = set()  # "TICKER_YYYY-MM-DD" keys
 
 
 # ── Cached fetchers — Market View ─────────────────────────────────────────────
@@ -263,6 +273,26 @@ def cached_market_scan() -> list:
 
     results.sort(key=lambda r: r["score"], reverse=True)
     return results
+
+
+# ── Cached fetchers — Portfolio ───────────────────────────────────────────────
+
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_account() -> dict:
+    """Alpaca paper account summary. TTL=30s."""
+    return get_account()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_positions() -> list:
+    """All open Alpaca positions. TTL=30s."""
+    return get_positions()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_orders(status: str = "all", limit: int = 20) -> list:
+    """Recent Alpaca orders. TTL=60s."""
+    return get_orders(status=status, limit=limit)
 
 
 # ── Formatting helpers ────────────────────────────────────────────────────────
@@ -1098,6 +1128,23 @@ def _render_screener_tab():
     else:
         watchlist = load_watchlist()
 
+        # Auto-log each Watch signal once per ticker per day (dedup via session state)
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        for _sr in scan_results:
+            _key = f"{_sr['ticker']}_{today_str}"
+            if _key not in st.session_state.logged_signals_today:
+                try:
+                    log_signal(
+                        ticker            = _sr["ticker"],
+                        anomaly_score     = _sr.get("score", 0),
+                        signals_triggered = _sr.get("signals", []),
+                        reason            = _sr.get("reason", ""),
+                        price_at_signal   = _sr.get("price") or 0.0,
+                    )
+                    st.session_state.logged_signals_today.add(_key)
+                except Exception:
+                    pass
+
         # Column header strip (HTML — no buttons)
         st.markdown(
             '<div style="display:grid;'
@@ -1180,6 +1227,394 @@ def _render_screener_tab():
                         add_ticker(ticker)
                         st.session_state.selected_ticker = ticker
                         st.rerun()
+
+
+# ── Portfolio Tab ─────────────────────────────────────────────────────────────
+
+def _render_portfolio_tab():
+    """Render the Alpaca paper trading portfolio panel."""
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    hdr_col, btn_col = st.columns([6, 1])
+    with hdr_col:
+        mh = get_market_hours()
+        session_color = GREEN if mh.get("is_open") else YELLOW
+        st.markdown(
+            f'<span style="font-size:1.1rem;font-weight:bold;color:{GREEN}">'
+            f'PORTFOLIO</span>'
+            f'&nbsp;&nbsp;<span style="color:{session_color};font-size:0.78rem">'
+            f'{mh.get("market_session","")}</span>'
+            f'&nbsp;&nbsp;<span style="color:{NEUTRAL};font-size:0.78rem">'
+            f'{mh.get("current_time_et","")}</span>',
+            unsafe_allow_html=True,
+        )
+    with btn_col:
+        if st.button("Refresh", key="portfolio_refresh", width="stretch"):
+            cached_account.clear()
+            cached_positions.clear()
+            cached_orders.clear()
+            st.rerun()
+
+    # ── ACCOUNT SUMMARY ───────────────────────────────────────────────────────
+    acct = cached_account()
+    if acct.get("error"):
+        st.error(f"Alpaca connection error: {acct['error']}")
+        st.caption("Check ALPACA_API_KEY and ALPACA_SECRET_KEY in your .env file.")
+    else:
+        c1, c2, c3, c4, c5 = st.columns(5)
+        with c1:
+            st.metric("Portfolio Value", f"${acct.get('portfolio_value', 0):,.2f}")
+        with c2:
+            st.metric("Cash", f"${acct.get('cash', 0):,.2f}")
+        with c3:
+            st.metric("Buying Power", f"${acct.get('buying_power', 0):,.2f}")
+        with c4:
+            dpnl     = acct.get("daily_pnl", 0)
+            dpnl_pct = acct.get("daily_pnl_pct", 0)
+            sign     = "+" if dpnl >= 0 else ""
+            st.metric(
+                "Day P&L",
+                f"{sign}${dpnl:,.2f}",
+                delta=f"{sign}{dpnl_pct:.2f}%",
+            )
+        with c5:
+            upl  = acct.get("unrealized_pl", 0)
+            uplpc = acct.get("unrealized_plpc", 0)
+            sign = "+" if upl >= 0 else ""
+            st.metric(
+                "Unrealized P&L",
+                f"{sign}${upl:,.2f}",
+                delta=f"{sign}{uplpc:.2f}%",
+            )
+
+    st.divider()
+
+    # ── OPEN POSITIONS ────────────────────────────────────────────────────────
+    st.markdown(
+        f'<span style="color:{NEUTRAL};font-size:0.75rem;font-weight:bold">'
+        f'OPEN POSITIONS</span>',
+        unsafe_allow_html=True,
+    )
+
+    positions = cached_positions()
+    if not positions:
+        st.caption("No open positions.")
+    else:
+        # Header strip
+        st.markdown(
+            '<div style="display:grid;'
+            'grid-template-columns:80px 60px 90px 90px 90px 80px 1fr;'
+            'gap:4px;padding:5px 0 3px 0;'
+            'font-size:0.7rem;color:#555;font-weight:bold;'
+            'border-bottom:1px solid #2a2d35;font-family:monospace">'
+            '<span>TICKER</span><span>QTY</span>'
+            '<span>AVG ENTRY</span><span>CURRENT</span>'
+            '<span>P&L</span><span>P&L %</span>'
+            '<span></span>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        for pos in positions:
+            ticker = pos["ticker"]
+            pl     = pos.get("unrealized_pl", 0)
+            plpc   = pos.get("unrealized_plpc", 0)
+            pl_c   = GREEN if pl >= 0 else RED
+            sign   = "+" if pl >= 0 else ""
+
+            pc1, pc2, pc3, pc4, pc5, pc6, pc7 = st.columns([1, 0.75, 1.1, 1.1, 1.1, 0.9, 1.1])
+            with pc1:
+                st.markdown(
+                    f'<span style="font-weight:bold;color:{BLUE};font-family:monospace">'
+                    f'{ticker}</span>',
+                    unsafe_allow_html=True,
+                )
+            with pc2:
+                st.markdown(
+                    f'<span style="font-size:0.82rem">{pos["qty"]:.0f}</span>',
+                    unsafe_allow_html=True,
+                )
+            with pc3:
+                st.markdown(
+                    f'<span style="font-size:0.82rem">'
+                    f'${pos.get("avg_entry_price",0):.2f}</span>',
+                    unsafe_allow_html=True,
+                )
+            with pc4:
+                st.markdown(
+                    f'<span style="font-size:0.82rem">'
+                    f'${pos.get("current_price",0):.2f}</span>',
+                    unsafe_allow_html=True,
+                )
+            with pc5:
+                st.markdown(
+                    f'<span style="color:{pl_c};font-size:0.82rem">'
+                    f'{sign}${pl:,.2f}</span>',
+                    unsafe_allow_html=True,
+                )
+            with pc6:
+                st.markdown(
+                    f'<span style="color:{pl_c};font-size:0.82rem">'
+                    f'{sign}{plpc:.2f}%</span>',
+                    unsafe_allow_html=True,
+                )
+            with pc7:
+                if st.button("Close", key=f"close_pos_{ticker}"):
+                    result = close_position(ticker)
+                    if result.get("error"):
+                        st.error(result["error"])
+                    else:
+                        cached_positions.clear()
+                        cached_account.clear()
+                        st.success(f"Closed {ticker}")
+                        st.rerun()
+
+    st.divider()
+
+    # ── NEW ORDER PANEL ───────────────────────────────────────────────────────
+    col_order, col_risk = st.columns([1, 1])
+
+    with col_order:
+        st.markdown(
+            f'<span style="color:{NEUTRAL};font-size:0.75rem;font-weight:bold">'
+            f'NEW PAPER ORDER</span>',
+            unsafe_allow_html=True,
+        )
+
+        # Show pending order confirmation if one is queued
+        if st.session_state.pending_order:
+            po = st.session_state.pending_order
+            st.warning(
+                f"Confirm: **{po['side'].upper()} {po['qty']} {po['ticker']}**  "
+                f"@ {po['order_type'].upper()}"
+                + (f"  (limit ${po.get('limit_price'):.2f})" if po.get("limit_price") else "")
+            )
+            conf_col, cancel_col = st.columns(2)
+            with conf_col:
+                if st.button("✓ Confirm Order", key="order_confirm", width="stretch"):
+                    result = place_order(
+                        ticker      = po["ticker"],
+                        qty         = po["qty"],
+                        side        = po["side"],
+                        order_type  = po["order_type"],
+                        limit_price = po.get("limit_price"),
+                    )
+                    st.session_state.pending_order = None
+                    if result.get("error"):
+                        st.error(f"Order failed: {result['error']}")
+                    else:
+                        log_trade(
+                            ticker      = po["ticker"],
+                            entry_price = po.get("limit_price") or 0.0,
+                            qty         = po["qty"],
+                            side        = po["side"],
+                            strategy_notes = f"Paper order via dashboard. ID: {result.get('id','')}",
+                        )
+                        cached_orders.clear()
+                        cached_account.clear()
+                        st.success(
+                            f"Order submitted! ID: {result.get('id','')[:8]}…  "
+                            f"Status: {result.get('status','')}"
+                        )
+                        st.rerun()
+            with cancel_col:
+                if st.button("✕ Cancel", key="order_cancel", width="stretch"):
+                    st.session_state.pending_order = None
+                    st.rerun()
+        else:
+            with st.form("new_order_form", clear_on_submit=False):
+                form_ticker = st.text_input(
+                    "Ticker", value=st.session_state.selected_ticker.upper(),
+                    placeholder="AAPL"
+                ).upper().strip()
+                form_qty  = st.number_input("Shares", min_value=1, value=10, step=1)
+                form_side = st.selectbox("Side", ["buy", "sell"])
+                form_type = st.selectbox("Order Type", ["market", "limit"])
+                form_lp   = None
+                if form_type == "limit":
+                    form_lp = st.number_input("Limit Price", min_value=0.01,
+                                              value=100.00, step=0.01, format="%.2f")
+                submitted = st.form_submit_button("Preview Order", use_container_width=True)
+
+            if submitted and form_ticker:
+                # Validate before queuing
+                acct_data = cached_account()
+                pos_data  = cached_positions() if not acct_data.get("error") else []
+                v = validate_trade(
+                    ticker        = form_ticker,
+                    side          = form_side,
+                    account_value = acct_data.get("portfolio_value", 0),
+                    buying_power  = acct_data.get("buying_power", 0),
+                    positions     = pos_data,
+                )
+                for w in v.get("warnings", []):
+                    st.warning(w)
+                for e in v.get("errors", []):
+                    st.error(e)
+                if v["valid"]:
+                    st.session_state.pending_order = {
+                        "ticker":      form_ticker,
+                        "qty":         int(form_qty),
+                        "side":        form_side,
+                        "order_type":  form_type,
+                        "limit_price": form_lp,
+                    }
+                    st.rerun()
+
+    with col_risk:
+        st.markdown(
+            f'<span style="color:{NEUTRAL};font-size:0.75rem;font-weight:bold">'
+            f'RISK CALCULATOR</span>',
+            unsafe_allow_html=True,
+        )
+        rc_ticker  = st.text_input(
+            "Ticker", value=st.session_state.selected_ticker.upper(),
+            key="rc_ticker", placeholder="AAPL"
+        ).upper().strip()
+        rc_entry   = st.number_input("Entry Price ($)", min_value=0.01,
+                                     value=150.00, step=0.01, format="%.2f", key="rc_entry")
+        rc_side    = st.selectbox("Side", ["buy", "sell"], key="rc_side")
+        rc_risk    = st.slider("Risk % of Account", 0.25, 5.0, 1.0, step=0.25, key="rc_risk")
+        rc_rr      = st.slider("Reward:Risk Ratio", 1.0, 5.0, 2.0, step=0.5, key="rc_rr")
+
+        if st.button("Calculate", key="rc_calc", width="stretch"):
+            with st.spinner("Fetching ATR…"):
+                rc_stop   = calculate_stop_loss(rc_ticker, rc_entry, rc_side)
+                rc_target = calculate_take_profit(rc_entry, rc_stop, rc_side, rc_rr)
+                acct_data = cached_account()
+                acct_val  = acct_data.get("portfolio_value", 100_000)
+                rc_shares = calculate_position_size(acct_val, rc_risk, rc_entry, rc_stop)
+
+            if rc_stop and rc_target:
+                stop_pct  = abs(rc_entry - rc_stop) / rc_entry * 100
+                tgt_pct   = abs(rc_target - rc_entry) / rc_entry * 100
+                stop_c    = RED  if rc_side == "buy" else GREEN
+                tgt_c     = GREEN if rc_side == "buy" else RED
+                st.markdown(
+                    f'<div style="font-family:monospace;font-size:0.82rem;'
+                    f'line-height:1.8;background:#1a1d24;padding:10px;border-radius:5px">'
+                    f'<b style="color:{NEUTRAL}">Entry</b>&nbsp;&nbsp;&nbsp;'
+                    f'${rc_entry:.2f}<br>'
+                    f'<b style="color:{stop_c}">Stop</b>&nbsp;&nbsp;&nbsp;&nbsp;'
+                    f'${rc_stop:.2f}'
+                    f'<span style="color:{NEUTRAL}"> ({stop_pct:.1f}%)</span><br>'
+                    f'<b style="color:{tgt_c}">Target</b>&nbsp;&nbsp;'
+                    f'${rc_target:.2f}'
+                    f'<span style="color:{NEUTRAL}"> ({tgt_pct:.1f}%)</span><br>'
+                    f'<b style="color:{BLUE}">Shares</b>&nbsp;&nbsp;'
+                    f'{rc_shares} @ {rc_risk:.2f}% risk<br>'
+                    f'<b style="color:{NEUTRAL}">$ Risk</b>&nbsp;&nbsp;&nbsp;'
+                    f'${acct_val * rc_risk / 100:,.0f}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.caption("Enter valid ticker and prices to calculate.")
+
+    st.divider()
+
+    # ── RECENT ORDERS ─────────────────────────────────────────────────────────
+    st.markdown(
+        f'<span style="color:{NEUTRAL};font-size:0.75rem;font-weight:bold">'
+        f'RECENT ORDERS</span>',
+        unsafe_allow_html=True,
+    )
+
+    orders = cached_orders(status="all", limit=15)
+    if not orders:
+        st.caption("No recent orders.")
+    else:
+        st.markdown(
+            '<div style="display:grid;'
+            'grid-template-columns:80px 55px 50px 70px 90px 90px 1fr;'
+            'gap:4px;padding:5px 0 3px 0;'
+            'font-size:0.7rem;color:#555;font-weight:bold;'
+            'border-bottom:1px solid #2a2d35;font-family:monospace">'
+            '<span>TICKER</span><span>QTY</span><span>SIDE</span>'
+            '<span>TYPE</span><span>STATUS</span><span>FILL</span>'
+            '<span>SUBMITTED</span>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        for o in orders:
+            side_c  = GREEN if o.get("side") == "buy" else RED
+            fill    = o.get("filled_price")
+            fill_s  = f"${fill:.2f}" if fill else "—"
+            status  = o.get("status", "")
+            stat_c  = GREEN if status == "filled" else (RED if status in ("canceled","rejected") else NEUTRAL)
+            # Cancel button only for open orders
+            oc1, oc2, oc3, oc4, oc5, oc6, oc7 = st.columns([1, 0.7, 0.65, 0.85, 1.1, 1.1, 1.7])
+            with oc1:
+                st.markdown(
+                    f'<span style="font-family:monospace;font-size:0.82rem">{o["ticker"]}</span>',
+                    unsafe_allow_html=True,
+                )
+            with oc2:
+                st.markdown(f'<span style="font-size:0.82rem">{o["qty"]:.0f}</span>',
+                            unsafe_allow_html=True)
+            with oc3:
+                st.markdown(
+                    f'<span style="color:{side_c};font-size:0.82rem">'
+                    f'{o.get("side","").upper()}</span>',
+                    unsafe_allow_html=True,
+                )
+            with oc4:
+                st.markdown(f'<span style="font-size:0.8rem">{o.get("order_type","")}</span>',
+                            unsafe_allow_html=True)
+            with oc5:
+                st.markdown(
+                    f'<span style="color:{stat_c};font-size:0.8rem">{status}</span>',
+                    unsafe_allow_html=True,
+                )
+            with oc6:
+                st.markdown(f'<span style="font-size:0.82rem">{fill_s}</span>',
+                            unsafe_allow_html=True)
+            with oc7:
+                st.markdown(
+                    f'<span style="color:{NEUTRAL};font-size:0.76rem">'
+                    f'{o.get("submitted_at","")[:16]}</span>',
+                    unsafe_allow_html=True,
+                )
+
+    st.divider()
+
+    # ── PERFORMANCE SUMMARY ───────────────────────────────────────────────────
+    st.markdown(
+        f'<span style="color:{NEUTRAL};font-size:0.75rem;font-weight:bold">'
+        f'TRADE LOG PERFORMANCE</span>',
+        unsafe_allow_html=True,
+    )
+
+    perf = get_performance_summary()
+    if perf.get("error"):
+        st.caption(f"Trade log error: {perf['error']}")
+    elif perf.get("total_trades", 0) == 0:
+        st.caption("No trades logged yet. Paper trades appear here after confirmation.")
+    else:
+        pc1, pc2, pc3, pc4, pc5 = st.columns(5)
+        with pc1:
+            st.metric("Total Trades", perf.get("total_trades", 0))
+        with pc2:
+            wr = perf.get("win_rate")
+            st.metric("Win Rate", f"{wr:.1f}%" if wr is not None else "N/A")
+        with pc3:
+            tpnl = perf.get("total_pnl", 0)
+            sign = "+" if tpnl >= 0 else ""
+            st.metric("Total P&L", f"{sign}${tpnl:,.2f}")
+        with pc4:
+            best = perf.get("best_trade")
+            st.metric("Best Trade", f"+${best:,.2f}" if best is not None else "N/A")
+        with pc5:
+            worst = perf.get("worst_trade")
+            wc    = RED if (worst or 0) < 0 else NEUTRAL
+            st.metric("Worst Trade", f"${worst:,.2f}" if worst is not None else "N/A")
+
+        w_col, l_col, o_col = st.columns(3)
+        with w_col:
+            st.caption(f"Wins: {perf.get('wins', 0)}")
+        with l_col:
+            st.caption(f"Losses: {perf.get('losses', 0)}")
+        with o_col:
+            st.caption(f"Open: {perf.get('open_trades', 0)}")
 
 
 # ── Main render ───────────────────────────────────────────────────────────────
@@ -1301,13 +1736,18 @@ def render():
     st.divider()
 
     # ── TOP-LEVEL TABS ────────────────────────────────────────────────────────
-    tab_market, tab_screener = st.tabs(["📊 Market View", "🔍 Screener"])
+    tab_market, tab_screener, tab_portfolio = st.tabs(
+        ["📊 Market View", "🔍 Screener", "💼 Portfolio"]
+    )
 
     with tab_market:
         _render_market_tab(selected)
 
     with tab_screener:
         _render_screener_tab()
+
+    with tab_portfolio:
+        _render_portfolio_tab()
 
     # ── AUTO-REFRESH (outside tabs — fires regardless of active tab) ──────────
     if time.time() >= st.session_state.next_refresh:
